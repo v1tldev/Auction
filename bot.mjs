@@ -149,12 +149,14 @@ async function startAnalysis(ctx, chatId, categories) {
   const cancelToken = { cancelled: false };
   runningScans.set(chatId, cancelToken);
 
-  await showScreen(
-    ctx,
-    chatId,
-    `Начинаю сбор данных по разделам:\n${categories.map((c) => c.name).join(", ")}\n\n(нажмите «${CANCEL_LABEL}», чтобы остановить)`,
-    cancelKeyboard()
-  );
+  // При скане всех категорий список из 23 названий в чате только мешает —
+  // пишем просто "по всем категориям". Для демо-теста (один раздел) название
+  // всё же полезно показать, чтобы было видно, что за раздел проверяется.
+  const startText = categories.length > 1
+    ? `Начинаю сканирование по всем категориям.\n\n(нажмите «${CANCEL_LABEL}», чтобы остановить)`
+    : `Начинаю сканирование раздела: ${categories[0].name}.\n\n(нажмите «${CANCEL_LABEL}», чтобы остановить)`;
+
+  await showScreen(ctx, chatId, startText, cancelKeyboard());
 
   // Статус прогресса шлём отдельным обычным сообщением, а не правкой того,
   // что показывает кнопку отмены: Telegram запрещает редактировать текст
