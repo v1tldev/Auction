@@ -1,0 +1,18 @@
+Auction/
+├── .env                        ← ваши секреты (FAJANS_USER/PASS, BOT_TOKEN)
+├── .gitignore
+├── package.json                ← добавил npm run scrape / npm run bot
+├── package-lock.json
+├── node_modules/
+├── scraper.mjs                 ← CLI, запуск: node scraper.mjs
+├── bot.mjs                     ← Telegram-бот, запуск: node bot.mjs
+├── src/
+│   ├── categories.mjs          ← список разделов
+│   ├── fajans-auth.mjs         ← логин + парсинг цены
+│   ├── scrape-core.mjs         ← вся логика обхода/скрапинга
+│   └── bot-store.mjs           ← сохранение выбранных категорий
+├── scripts/
+│   └── run-login-test.mjs      ← ручной тест логина
+└── data/
+    ├── bot-config.json         ← конфиг бота (генерируется)
+    └── lots.json               ← результат последнего скрапа 

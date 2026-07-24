@@ -1,0 +1,21 @@
+{
+  "name": "fajans-scraper-bot",
+  "version": "1.0.0",
+  "description": "Скрапер лотов fajans.lv + Telegram-бот",
+  "main": "bot.mjs",
+  "scripts": {
+    "scrape": "node scraper.mjs",
+    "bot": "node bot.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@grammyjs/runner": "^2.0.3",
+    "cheerio": "^1.2.0",
+    "dotenv": "^17.4.2",
+    "grammy": "^1.45.1",
+    "openai": "^6.49.0"
+  }
+}

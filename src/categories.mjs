@@ -1,0 +1,42 @@
+// Полный список разделов аукциона fajans.lv (проверено напрямую по сайту).
+export const CATEGORIES = [
+  { slug: "paintings", name: "Живопись" },
+  { slug: "kuznetsov", name: "Фарфор Фабрики Кузнецова" },
+  { slug: "latvianporcelain", name: "Фарфор, Керамика (Латвия)" },
+  { slug: "porcelain", name: "Фарфор, Фаянс, Керамика" },
+  { slug: "figurines", name: "Статуэтки" },
+  { slug: "glassholders", name: "Подстаканники" },
+  { slug: "woodproducts", name: "Изделия из дерева" },
+  { slug: "crystal", name: "Хрусталь, Стекло" },
+  { slug: "christmasdecoration", name: "Елочные игрушки" },
+  { slug: "lacquerminiature", name: "Лаковая миниатюра" },
+  { slug: "Silver", name: "Серебро" },
+  { slug: "jewelry", name: "Ювелирные изделия" },
+  { slug: "numismatics", name: "Нумизматика" },
+  { slug: "faleristicslatvia", name: "Фалеристика (Латвия и СССР)" },
+  { slug: "falerestics", name: "Фалеристика" },
+  { slug: "artworks", name: "Художественное литьё" },
+  { slug: "watch", name: "Часы" },
+  { slug: "icon", name: "Кресты, Иконы, Складни" },
+  { slug: "bonistics", name: "Бонистика" },
+  { slug: "otherantique", name: "Другие предметы интерьера и коллекционирования" },
+  { slug: "photospostcards", name: "Фотографии и Открытки" },
+  { slug: "otherprintworks", name: "Другая Печатная Продукция" },
+  { slug: "scalecars", name: "Автомодели и Игрушки" },
+  { slug: "ussrcameras", name: "Фототехника и Видеотехника" },
+  { slug: "bibliopoly", name: "Букинистика" },
+];
+
+// Разделы, которые были выбраны изначально (до появления полного списка) —
+// используются как выбор по умолчанию, пока пользователь сам не поменяет набор.
+export const DEFAULT_SELECTED_SLUGS = [
+  "paintings",
+  "kuznetsov",
+  "latvianporcelain",
+  "porcelain",
+  "figurines",
+  "watch",
+  "bonistics",
+  "numismatics",
+  "scalecars",
+];
