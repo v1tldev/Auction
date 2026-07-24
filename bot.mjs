@@ -2,9 +2,9 @@ import "dotenv/config";
 import { Bot, Keyboard, InlineKeyboard } from "grammy";
 import { run } from "@grammyjs/runner";
 import { CATEGORIES } from "./src/categories.mjs";
-import { scrapeCategories } from "./src/scrape-core.mjs";
+import { scrapeCategories, checkPricesVisible } from "./src/scrape-core.mjs";
 import { loginAndGetSession } from "./src/fajans-auth.mjs";
-import { getSelectedSlugs, setSelectedSlugs } from "./src/bot-store.mjs";
+import { getAccountOverride, setAccountOverride, clearAccountOverride } from "./src/account-store.mjs";
 
 if (!process.env.BOT_TOKEN) {
   console.error("В .env не задан BOT_TOKEN — получите токен у @BotFather в Telegram и впишите его в .env");
@@ -13,18 +13,27 @@ if (!process.env.BOT_TOKEN) {
 
 const bot = new Bot(process.env.BOT_TOKEN);
 
-const NAME_TO_SLUG = new Map(CATEGORIES.map((c) => [c.name, c.slug]));
-const DONE_LABEL = "✅ Готово";
-const SELECT_CATEGORIES_LABEL = "📂 Выбрать разделы";
-const START_ANALYSIS_LABEL = "▶️ Начать анализ";
+// Сколько разделов показывать на одной странице инлайн-клавиатуры выбора
+// демо-раздела — весь список (23 штуки) не влезет в один экран без пролистывания.
+const DEMO_PAGE_SIZE = 8;
+
+const SCAN_ALL_LABEL = "🔎 Сканировать";
+const DEMO_LABEL = "🧪 Демо-тест категории";
+const ACCOUNT_LABEL = "👤 Сменить аккаунт";
+const CHANGE_CREDS_LABEL = "✏️ Сменить логин и пароль";
+const RESET_ACCOUNT_LABEL = "↩️ Поставить аккаунт по умолчанию";
+const BACK_LABEL = "⬅️ Назад";
+const CANCEL_ACCOUNT_LABEL = "❌ Отмена";
 const CANCEL_LABEL = "❌ Отменить сканирование";
 
-// Состояние экрана на чат: какое reply-меню сейчас показано и id последнего
-// служебного сообщения бота (чтобы удалять его перед показом следующего экрана).
-const uiState = new Map(); // chatId -> { mode: "main" | "categories" | "scanning", lastMessageId }
+// Состояние экрана на чат: какое reply-меню сейчас показано, id последнего
+// служебного сообщения бота (чтобы удалять его перед показом следующего экрана)
+// и pendingUsername — логин, введённый на предыдущем шаге смены аккаунта,
+// пока ждём пароль вторым сообщением.
+const uiState = new Map(); // chatId -> { mode, lastMessageId, pendingUsername }
 // Флаги отмены для запущенных сканирований.
 const runningScans = new Map(); // chatId -> { cancelled: boolean }
-// Результаты последнего анализа: { lots, index } — index нужен для режима "листать".
+// Результаты последнего анализа: { groups } — groups: [[categoryName, lots[]], ...].
 const sessions = new Map();
 
 function getState(chatId) {
@@ -51,38 +60,60 @@ async function showScreen(ctx, chatId, text, keyboard) {
 
 function mainKeyboard() {
   return new Keyboard()
-    .text(SELECT_CATEGORIES_LABEL).row()
-    .text(START_ANALYSIS_LABEL)
+    .text(SCAN_ALL_LABEL).row()
+    .text(DEMO_LABEL).row()
+    .text(ACCOUNT_LABEL)
     .resized();
 }
 
-function categoriesKeyboard(selectedSlugs) {
-  const kb = new Keyboard();
-  CATEGORIES.forEach((cat, i) => {
-    const mark = selectedSlugs.includes(cat.slug) ? "✅ " : "▫️ ";
-    kb.text(mark + cat.name);
-    if (i % 2 === 1) kb.row();
-  });
-  if (CATEGORIES.length % 2 === 1) kb.row();
-  kb.text(DONE_LABEL);
-  return kb.resized();
+function accountMenuKeyboard() {
+  return new Keyboard()
+    .text(CHANGE_CREDS_LABEL).row()
+    .text(RESET_ACCOUNT_LABEL).row()
+    .text(BACK_LABEL)
+    .resized();
+}
+
+function cancelAccountKeyboard() {
+  return new Keyboard().text(CANCEL_ACCOUNT_LABEL).resized();
 }
 
 function cancelKeyboard() {
   return new Keyboard().text(CANCEL_LABEL).resized();
 }
 
-function resultsMenu() {
-  return new InlineKeyboard()
-    .text("📋 Списком", "results:list").row()
-    .text("🔎 Листать", "results:browse:0");
+// Список разделов постранично — по кнопке на раздел плюс листалка внизу,
+// чтобы не вываливать все 23 раздела разом в один экран.
+function demoCategoryKeyboard(page) {
+  const totalPages = Math.ceil(CATEGORIES.length / DEMO_PAGE_SIZE);
+  const start = page * DEMO_PAGE_SIZE;
+  const kb = new InlineKeyboard();
+  CATEGORIES.slice(start, start + DEMO_PAGE_SIZE).forEach((cat) => {
+    kb.text(cat.name, `demorun:${cat.slug}`).row();
+  });
+  kb.text("◀️", `demopage:${page - 1}`)
+    .text(`${page + 1}/${totalPages}`, "noop")
+    .text("▶️", `demopage:${page + 1}`);
+  return kb;
 }
 
-function browseKeyboard(index, total) {
+// groups: [[categoryName, lots[]], ...] — по кнопке на раздел, с количеством
+// отобранных ИИ лотов в каждом.
+function categoriesInlineKeyboard(groups) {
+  const kb = new InlineKeyboard();
+  groups.forEach(([name, lots], i) => {
+    kb.text(`${name} (${lots.length})`, `cat:${i}`).row();
+  });
+  return kb;
+}
+
+function browseKeyboard(catIndex, index, total) {
   return new InlineKeyboard()
-    .text("◀️", "results:browse:" + (index - 1))
+    .text("◀️", `browse:${catIndex}:${index - 1}`)
     .text(`${index + 1}/${total}`, "noop")
-    .text("▶️", "results:browse:" + (index + 1));
+    .text("▶️", `browse:${catIndex}:${index + 1}`)
+    .row()
+    .text("⬅️ К разделам", "back");
 }
 
 function formatLot(lot) {
@@ -98,7 +129,10 @@ bot.command("start", async (ctx) => {
   await showScreen(
     ctx,
     chatId,
-    "Привет! Это бот-мониторинг лотов fajans.lv.\n\nВыберите разделы для анализа и запустите сбор данных.",
+    "Привет! Это бот-мониторинг лотов fajans.lv.\n\n" +
+      `«${SCAN_ALL_LABEL}» — проанализировать ИИ все разделы аукциона.\n` +
+      `«${DEMO_LABEL}» — быстрый тестовый прогон по одному разделу на выбор.\n` +
+      `«${ACCOUNT_LABEL}» — использовать свой аккаунт fajans.lv вместо стандартного.`,
     mainKeyboard()
   );
 });
@@ -109,15 +143,7 @@ async function finishScanning(ctx, chatId, text) {
   await showScreen(ctx, chatId, text, mainKeyboard());
 }
 
-async function startAnalysis(ctx, chatId) {
-  const selectedSlugs = getSelectedSlugs(chatId);
-  const categories = CATEGORIES.filter((c) => selectedSlugs.includes(c.slug));
-
-  if (!categories.length) {
-    await ctx.reply("Сначала выберите хотя бы один раздел.");
-    return;
-  }
-
+async function startAnalysis(ctx, chatId, categories) {
   const state = getState(chatId);
   state.mode = "scanning";
   const cancelToken = { cancelled: false };
@@ -139,7 +165,12 @@ async function startAnalysis(ctx, chatId) {
   const progressMsg = await ctx.reply("Собираю данные...");
   const progressMessageId = progressMsg.message_id;
 
-  const { FAJANS_USER, FAJANS_PASS, API_KEY } = process.env;
+  // Свой аккаунт (если клиент его задал через "Сменить аккаунт") приоритетнее
+  // дефолтного из .env — так у каждого чата может быть свой fajans.lv-логин.
+  const override = getAccountOverride(chatId);
+  const FAJANS_USER = override?.username ?? process.env.FAJANS_USER;
+  const FAJANS_PASS = override?.password ?? process.env.FAJANS_PASS;
+  const { API_KEY } = process.env;
   if (!FAJANS_USER || !FAJANS_PASS) {
     runningScans.delete(chatId);
     await ctx.api.deleteMessage(chatId, progressMessageId).catch(() => {});
@@ -159,33 +190,44 @@ async function startAnalysis(ctx, chatId) {
   let deals = [];
   let scanned = 0;
   let loginFailed = false;
+  let pricesGated = false;
   try {
     const login = await loginAndGetSession(FAJANS_USER, FAJANS_PASS);
     if (!login.success) {
       loginFailed = true;
     } else {
-      let lastEditAt = 0;
-      const result = await scrapeCategories(categories, login.cookieJar, {
-        isCancelled: () => cancelToken.cancelled,
-        async onProgress(p) {
-          const now = Date.now();
-          if (now - lastEditAt < 2500) return; // не долбим Telegram API правками чаще раза в 2.5с
-          lastEditAt = now;
-          const progressText =
-            p.stage === "listing"
-              ? `Собираю список: ${p.name} — стр. ${p.page}/${p.totalPages}`
-              : p.stage === "detail"
-              ? `Собираю данные по лотам: ${p.index}/${p.total}`
-              : `Оцениваю через ИИ: ${p.done}/${p.total}`;
-          try {
-            await ctx.api.editMessageText(chatId, progressMessageId, progressText);
-          } catch {
-            // сообщение могло не измениться с прошлой правки — Telegram в этом случае просто отдаёт ошибку, игнорируем
-          }
-        },
-      });
-      deals = result.deals;
-      scanned = result.scanned;
+      // Аккаунт может формально залогиниться (куки, редирект), но при этом не
+      // видеть цены — например, если он не прошёл модерацию на сайте. Раньше
+      // это тихо приводило к "0 сделок найдено" без объяснений: скан проходил
+      // весь список лотов, а фильтр молча пропускал их все из-за отсутствия
+      // цены. Теперь проверяем доступ к ценам ДО полного скана.
+      const access = await checkPricesVisible(categories, login.cookieJar);
+      if (access.visible === false) {
+        pricesGated = true;
+      } else {
+        let lastEditAt = 0;
+        const result = await scrapeCategories(categories, login.cookieJar, {
+          isCancelled: () => cancelToken.cancelled,
+          async onProgress(p) {
+            const now = Date.now();
+            if (now - lastEditAt < 2500) return; // не долбим Telegram API правками чаще раза в 2.5с
+            lastEditAt = now;
+            const progressText =
+              p.stage === "listing"
+                ? `Собираю список: ${p.name} — стр. ${p.page}/${p.totalPages}`
+                : p.stage === "detail"
+                ? `Собираю данные по лотам: ${p.index}/${p.total}`
+                : `Оцениваю через ИИ: ${p.done}/${p.total}`;
+            try {
+              await ctx.api.editMessageText(chatId, progressMessageId, progressText);
+            } catch {
+              // сообщение могло не измениться с прошлой правки — Telegram в этом случае просто отдаёт ошибку, игнорируем
+            }
+          },
+        });
+        deals = result.deals;
+        scanned = result.scanned;
+      }
     }
   } catch (err) {
     console.error("Ошибка при сканировании:", err);
@@ -203,9 +245,29 @@ async function startAnalysis(ctx, chatId) {
     await finishScanning(ctx, chatId, "Не удалось залогиниться на fajans.lv.");
     return;
   }
+  if (pricesGated) {
+    await finishScanning(
+      ctx,
+      chatId,
+      `Аккаунт ${FAJANS_USER} залогинился, но не видит цены на лотах (сайт показывает "Только зарегистрированные пользователи могут принять участие в торгах"). ` +
+        "Возможно, аккаунт не прошёл модерацию на fajans.lv — проверьте его статус на сайте или замените аккаунт."
+    );
+    return;
+  }
 
   const wasCancelled = cancelToken.cancelled;
-  sessions.set(chatId, { lots: deals, index: 0 });
+
+  // Группируем отобранные лоты по разделу (как их вернул скрапинг — лот,
+  // подошедший сразу под несколько разделов, попадёт в свою комбинированную
+  // группу, а не задвоится в каждом разделе по отдельности), чтобы показать
+  // кнопку на каждый раздел с количеством находок.
+  const groupsMap = new Map();
+  for (const lot of deals) {
+    if (!groupsMap.has(lot.category)) groupsMap.set(lot.category, []);
+    groupsMap.get(lot.category).push(lot);
+  }
+  const groups = [...groupsMap.entries()];
+  sessions.set(chatId, { groups });
 
   await finishScanning(
     ctx,
@@ -215,8 +277,8 @@ async function startAnalysis(ctx, chatId) {
       : `Готово! Отсканировано ${scanned} лотов, найдено подходящих по цене — ${deals.length}.`
   );
 
-  if (deals.length) {
-    await ctx.reply("Как показать результаты?", { reply_markup: resultsMenu() });
+  if (groups.length) {
+    await ctx.reply("Выберите раздел, чтобы посмотреть отобранные лоты:", { reply_markup: categoriesInlineKeyboard(groups) });
   }
 }
 
@@ -226,61 +288,97 @@ bot.on("message:text", async (ctx) => {
   const state = getState(chatId);
 
   if (state.mode === "main") {
-    if (text === SELECT_CATEGORIES_LABEL) {
-      state.mode = "categories";
-      const selected = getSelectedSlugs(chatId);
-      await showScreen(
-        ctx,
-        chatId,
-        "Выберите разделы для анализа (нажмите, чтобы включить/выключить):",
-        categoriesKeyboard(selected)
-      );
+    if (text === SCAN_ALL_LABEL) {
+      await startAnalysis(ctx, chatId, CATEGORIES);
       return;
     }
-    if (text === START_ANALYSIS_LABEL) {
-      await startAnalysis(ctx, chatId);
+    if (text === DEMO_LABEL) {
+      await ctx.reply("Выберите раздел для демо-теста:", { reply_markup: demoCategoryKeyboard(0) });
+      return;
+    }
+    if (text === ACCOUNT_LABEL) {
+      state.mode = "account_menu";
+      const override = getAccountOverride(chatId);
+      const status = override
+        ? `Сейчас используется свой аккаунт: ${override.username}`
+        : "Сейчас используется аккаунт по умолчанию (прописан в .env в папке с кодом).";
+      await showScreen(ctx, chatId, `${status}\n\nЧто сделать?`, accountMenuKeyboard());
       return;
     }
     return;
   }
 
-  if (state.mode === "categories") {
-    if (text === DONE_LABEL) {
+  if (state.mode === "account_menu") {
+    if (text === CHANGE_CREDS_LABEL) {
+      state.mode = "awaiting_username";
+      await showScreen(ctx, chatId, "Пришлите логин (email) от аккаунта fajans.lv:", cancelAccountKeyboard());
+      return;
+    }
+    if (text === RESET_ACCOUNT_LABEL) {
+      clearAccountOverride(chatId);
       state.mode = "main";
-      const selected = getSelectedSlugs(chatId);
-      const names = CATEGORIES.filter((c) => selected.includes(c.slug)).map((c) => c.name);
+      await showScreen(ctx, chatId, "Готово, снова используется аккаунт по умолчанию (из .env).", mainKeyboard());
+      return;
+    }
+    if (text === BACK_LABEL) {
+      state.mode = "main";
+      await showScreen(ctx, chatId, "Главное меню.", mainKeyboard());
+      return;
+    }
+    return;
+  }
+
+  if (state.mode === "awaiting_username") {
+    if (text === CANCEL_ACCOUNT_LABEL) {
+      state.mode = "main";
+      await showScreen(ctx, chatId, "Отменено.", mainKeyboard());
+      return;
+    }
+    state.pendingUsername = text.trim();
+    state.mode = "awaiting_password";
+    // Логин не такой чувствительный, как пароль, но тоже незачем оставлять в истории чата.
+    await ctx.api.deleteMessage(chatId, ctx.message.message_id).catch(() => {});
+    await showScreen(ctx, chatId, "Теперь пришлите пароль:", cancelAccountKeyboard());
+    return;
+  }
+
+  if (state.mode === "awaiting_password") {
+    if (text === CANCEL_ACCOUNT_LABEL) {
+      state.mode = "main";
+      delete state.pendingUsername;
+      await showScreen(ctx, chatId, "Отменено.", mainKeyboard());
+      return;
+    }
+
+    const username = state.pendingUsername;
+    const password = text.trim();
+    delete state.pendingUsername;
+    // Пароль тем более не должен оставаться в истории чата плейнтекстом.
+    await ctx.api.deleteMessage(chatId, ctx.message.message_id).catch(() => {});
+
+    await ctx.reply("Проверяю логин и пароль на fajans.lv...");
+    const login = await loginAndGetSession(username, password);
+    state.mode = "main";
+    if (!login.success) {
       await showScreen(
         ctx,
         chatId,
-        `Сохранено. Выбрано разделов: ${selected.length}.\n${names.join(", ") || "(ничего не выбрано)"}`,
+        "Не удалось войти с этими данными — fajans.lv не принял логин/пароль. Аккаунт не изменён, остался прежний.",
         mainKeyboard()
       );
       return;
     }
 
-    const bareName = text.replace(/^(✅ |▫️ )/, "");
-    const slug = NAME_TO_SLUG.get(bareName);
-    if (slug) {
-      const selected = getSelectedSlugs(chatId);
-      const updated = selected.includes(slug) ? selected.filter((s) => s !== slug) : [...selected, slug];
-      setSelectedSlugs(chatId, updated);
-      await showScreen(
-        ctx,
-        chatId,
-        "Выберите разделы для анализа (нажмите, чтобы включить/выключить):",
-        categoriesKeyboard(updated)
-      );
-    }
+    setAccountOverride(chatId, username, password);
+    await showScreen(ctx, chatId, `Готово! Теперь используется аккаунт: ${username}`, mainKeyboard());
     return;
   }
 
   if (state.mode === "scanning") {
-    console.log("[DEBUG] in scanning branch, text matches CANCEL_LABEL?", text === CANCEL_LABEL, "runningScans has token?", runningScans.has(chatId));
     if (text === CANCEL_LABEL) {
       const token = runningScans.get(chatId);
       if (token && !token.cancelled) {
         token.cancelled = true;
-        console.log("[DEBUG] cancelled flag set to true");
         await ctx.reply("Останавливаю сканирование, подождите...");
       }
     }
@@ -288,47 +386,65 @@ bot.on("message:text", async (ctx) => {
   }
 });
 
-bot.callbackQuery("results:list", async (ctx) => {
-  const chatId = ctx.chat.id;
+bot.callbackQuery(/^demopage:(-?\d+)$/, async (ctx) => {
   await ctx.answerCallbackQuery();
-  const session = sessions.get(chatId);
-  if (!session || !session.lots.length) {
-    await ctx.reply("Сначала запустите анализ.");
-    return;
-  }
-
-  // Укладываемся в лимит Telegram на длину сообщения (4096 символов) — режем на части.
-  let chunk = "";
-  for (const lot of session.lots) {
-    const line = formatLot(lot);
-    if (chunk && (chunk + "\n\n" + line).length > 3500) {
-      await ctx.reply(chunk);
-      chunk = line;
-    } else {
-      chunk = chunk ? chunk + "\n\n" + line : line;
-    }
-  }
-  if (chunk) await ctx.reply(chunk);
+  const totalPages = Math.ceil(CATEGORIES.length / DEMO_PAGE_SIZE);
+  let page = Number(ctx.match[1]);
+  if (page < 0) page = totalPages - 1;
+  if (page >= totalPages) page = 0;
+  await ctx.editMessageReplyMarkup({ reply_markup: demoCategoryKeyboard(page) });
 });
 
-bot.callbackQuery(/^results:browse:(-?\d+)$/, async (ctx) => {
+bot.callbackQuery(/^demorun:(.+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const category = CATEGORIES.find((c) => c.slug === ctx.match[1]);
+  if (!category) return;
+  await startAnalysis(ctx, ctx.chat.id, [category]);
+});
+
+bot.callbackQuery(/^cat:(\d+)$/, async (ctx) => {
   const chatId = ctx.chat.id;
   await ctx.answerCallbackQuery();
   const session = sessions.get(chatId);
-  if (!session || !session.lots.length) {
+  const group = session?.groups[Number(ctx.match[1])];
+  if (!group) {
     await ctx.reply("Сначала запустите анализ.");
     return;
   }
 
-  const total = session.lots.length;
-  let index = Number(ctx.match[1]);
+  const catIndex = Number(ctx.match[1]);
+  const [, lots] = group;
+  const lot = lots[0];
+  const caption = formatLot(lot);
+  const keyboard = browseKeyboard(catIndex, 0, lots.length);
+
+  try {
+    await ctx.replyWithPhoto(lot.mainPhoto, { caption, reply_markup: keyboard });
+  } catch (err) {
+    await ctx.reply(`Не удалось показать фото лота #${lot.id}: ${err.message}`);
+  }
+});
+
+bot.callbackQuery(/^browse:(\d+):(-?\d+)$/, async (ctx) => {
+  const chatId = ctx.chat.id;
+  await ctx.answerCallbackQuery();
+  const session = sessions.get(chatId);
+  const catIndex = Number(ctx.match[1]);
+  const group = session?.groups[catIndex];
+  if (!group) {
+    await ctx.reply("Сначала запустите анализ.");
+    return;
+  }
+
+  const [, lots] = group;
+  const total = lots.length;
+  let index = Number(ctx.match[2]);
   if (index < 0) index = total - 1;
   if (index >= total) index = 0;
-  session.index = index;
 
-  const lot = session.lots[index];
+  const lot = lots[index];
   const caption = formatLot(lot);
-  const keyboard = browseKeyboard(index, total);
+  const keyboard = browseKeyboard(catIndex, index, total);
 
   try {
     if (ctx.callbackQuery.message.photo) {
@@ -341,6 +457,17 @@ bot.callbackQuery(/^results:browse:(-?\d+)$/, async (ctx) => {
   } catch (err) {
     await ctx.reply(`Не удалось показать фото лота #${lot.id}: ${err.message}`);
   }
+});
+
+bot.callbackQuery("back", async (ctx) => {
+  const chatId = ctx.chat.id;
+  await ctx.answerCallbackQuery();
+  const session = sessions.get(chatId);
+  if (!session) {
+    await ctx.reply("Сначала запустите анализ.");
+    return;
+  }
+  await ctx.reply("Выберите раздел, чтобы посмотреть отобранные лоты:", { reply_markup: categoriesInlineKeyboard(session.groups) });
 });
 
 bot.callbackQuery("noop", (ctx) => ctx.answerCallbackQuery());

@@ -13,8 +13,6 @@ export const CATEGORIES = [
   { slug: "Silver", name: "Серебро" },
   { slug: "jewelry", name: "Ювелирные изделия" },
   { slug: "numismatics", name: "Нумизматика" },
-  { slug: "faleristicslatvia", name: "Фалеристика (Латвия и СССР)" },
-  { slug: "falerestics", name: "Фалеристика" },
   { slug: "artworks", name: "Художественное литьё" },
   { slug: "watch", name: "Часы" },
   { slug: "icon", name: "Кресты, Иконы, Складни" },
@@ -25,18 +23,4 @@ export const CATEGORIES = [
   { slug: "scalecars", name: "Автомодели и Игрушки" },
   { slug: "ussrcameras", name: "Фототехника и Видеотехника" },
   { slug: "bibliopoly", name: "Букинистика" },
-];
-
-// Разделы, которые были выбраны изначально (до появления полного списка) —
-// используются как выбор по умолчанию, пока пользователь сам не поменяет набор.
-export const DEFAULT_SELECTED_SLUGS = [
-  "paintings",
-  "kuznetsov",
-  "latvianporcelain",
-  "porcelain",
-  "figurines",
-  "watch",
-  "bonistics",
-  "numismatics",
-  "scalecars",
 ];

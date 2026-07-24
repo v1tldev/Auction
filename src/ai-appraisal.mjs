@@ -51,9 +51,11 @@ export async function appraiseLot({ title, description, mainPhoto }) {
 }
 
 // Условие сделки: аукционная цена минимум в 3 раза меньше рыночной, и при этом
-// разница между рыночной и аукционной ценой — не меньше 30 евро (иначе выгода в
+// разница между рыночной и аукционной ценой — не меньше 100 евро (иначе выгода в
 // абсолютных числах слишком мала, даже если соотношение формально подходит).
+// Порог подняли с 30€ до 100€ по просьбе клиента — со старым фильтром находилось
+// слишком много мелких лотов, а нужны именно "жемчужины".
 export function passesDealFilter(auctionPrice, marketPrice) {
   if (auctionPrice == null || marketPrice == null) return false;
-  return auctionPrice * 3 <= marketPrice && marketPrice - auctionPrice >= 30;
+  return auctionPrice * 3 <= marketPrice && marketPrice - auctionPrice >= 100;
 }

@@ -56,7 +56,23 @@ export async function scrapeLotDetail(lotId, cookieJar) {
   const description = descriptionNode.text().replace(/\s+/g, " ").trim();
 
   const { gated, currentBid } = parsePriceFromLoadedHtml($);
-  return { mainPhoto, price: gated ? null : currentBid, description };
+  return { mainPhoto, price: gated ? null : currentBid, description, gated };
+}
+
+// Проверяет ДО полного скана, видит ли аккаунт вообще цены (гейт "Только
+// зарегистрированные пользователи..." бывает даже у формально залогиненного
+// аккаунта — например, если он не прошёл модерацию на сайте). Смотрим на
+// первый попавшийся лот из переданных разделов — не гонять же весь скан
+// впустую, чтобы в конце получить 0 сделок без объяснения причины.
+export async function checkPricesVisible(categories, cookieJar) {
+  for (const { slug } of categories) {
+    const { lots } = await fetchCategoryPage(slug, 1);
+    if (lots.length) {
+      const detail = await scrapeLotDetail(lots[0].id, cookieJar);
+      return { visible: !detail.gated };
+    }
+  }
+  return { visible: null }; // ни в одном разделе не нашлось ни одного лота — нечем проверить
 }
 
 const defaultPoliteWait = () => new Promise((r) => setTimeout(r, 400 + Math.random() * 200));
@@ -94,7 +110,7 @@ function createLimiter(concurrency) {
  *   обход останавливается досрочно (уже запущенные оценки ИИ доигрываются до конца)
  *
  * Возвращает { deals, scanned, found }, где deals — лоты, прошедшие фильтр
- * "аукционная цена минимум в 3 раза меньше рыночной, и разница — не меньше 30€",
+ * "аукционная цена минимум в 3 раза меньше рыночной, и разница — не меньше 100€",
  * с добавленными полями marketPrice/aiComment.
  */
 export async function scrapeCategories(categories, cookieJar, options = {}) {
