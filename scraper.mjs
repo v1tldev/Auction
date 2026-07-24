@@ -33,7 +33,7 @@ async function main() {
   }
 
   let lastCategory = null;
-  const results = await scrapeCategories(CATEGORIES, cookieJar, {
+  const { deals, scanned, found } = await scrapeCategories(CATEGORIES, cookieJar, {
     onProgress(p) {
       if (p.stage === "listing") {
         if (p.name !== lastCategory) {
@@ -41,16 +41,19 @@ async function main() {
           lastCategory = p.name;
         }
         console.log(`  страница ${p.page}/${p.totalPages}`);
+      } else if (p.stage === "detail") {
+        console.log(`[детали ${p.index}/${p.total}]`);
       } else {
-        console.log(`[${p.index}/${p.total}] ${p.lot.category} / лот ${p.lot.id}: ${p.lot.title.slice(0, 60)}...`);
-        if (p.lot.error) console.error(`  ошибка:`, p.lot.error);
+        console.log(`[ИИ-оценка ${p.done}/${p.total}]`);
       }
     },
   });
 
   const fs = await import("fs");
-  fs.writeFileSync(OUT_FILE, JSON.stringify(results, null, 2), "utf-8");
-  console.log(`\nСохранено ${results.length} лотов в ${OUT_FILE}`);
+  const path = await import("path");
+  fs.mkdirSync(path.dirname(OUT_FILE), { recursive: true });
+  fs.writeFileSync(OUT_FILE, JSON.stringify(deals, null, 2), "utf-8");
+  console.log(`\nОтсканировано ${scanned} из ${found} найденных лотов, подходящих по цене — ${deals.length}. Сохранено в ${OUT_FILE}`);
 }
 
 main().catch((err) => {

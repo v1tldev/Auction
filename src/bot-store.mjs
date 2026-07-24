@@ -1,4 +1,5 @@
 import fs from "fs";
+import path from "path";
 import { DEFAULT_SELECTED_SLUGS } from "./categories.mjs";
 
 // Путь считается от текущей рабочей директории процесса (запускаем bot.mjs из
@@ -14,6 +15,10 @@ function loadConfig() {
 }
 
 function saveConfig(config) {
+  // На свежем окружении (например, только что склонированный репозиторий на VPS)
+  // папки ./data ещё может не быть — locally она давно создана прошлыми запусками,
+  // из-за чего это всплыло только на новом сервере.
+  fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), "utf-8");
 }
 
