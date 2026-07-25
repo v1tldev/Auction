@@ -1,6 +1,6 @@
 import * as cheerio from "cheerio";
 import { BASE, BROWSER_HEADERS, jarToHeader, parsePriceFromLoadedHtml, withTimeout } from "./fajans-auth.mjs";
-import { appraiseLot, passesDealFilter } from "./ai-appraisal.mjs";
+import { appraiseLot, passesDealFilter, AIQuotaExceededError } from "./ai-appraisal.mjs";
 
 // ВАЖНО: за последней реальной страницей категории сайт НЕ отдаёт пустой список —
 // он просто повторяет последнюю страницу снова и снова для любого page=N сверх
@@ -28,8 +28,17 @@ export async function fetchCategoryPage(slug, page) {
     lots.push({ id, title: rawTitle.replace(new RegExp(`^#${id}\\s*`), "") });
   });
 
-  const lastPageHref = $("ul.pagination li.last a").attr("href");
-  const totalPages = lastPageHref ? Number(new URL(lastPageHref, BASE).searchParams.get("page")) || 1 : 1;
+  // На последней странице категории пункт "Последняя" в пагинации становится
+  // disabled и превращается в <span> без ссылки (вместо <a href>) — раньше
+  // из-за этого totalPages на последней странице тихо схлопывался до 1
+  // (например, "стр. 5/1" вместо "5/5"). Номерные ссылки страниц, наоборот,
+  // всегда несут атрибут data-page (0-based) независимо от того, активна
+  // страница или нет — берём максимум по ним, это надёжнее.
+  let totalPages = 1;
+  $("ul.pagination a[data-page]").each((_, el) => {
+    const dataPage = Number($(el).attr("data-page"));
+    if (Number.isFinite(dataPage)) totalPages = Math.max(totalPages, dataPage + 1);
+  });
 
   return { lots, totalPages };
 }
@@ -109,11 +118,14 @@ function createLimiter(concurrency) {
  * options.isCancelled: функция () => boolean — проверяется между запросами; при true
  *   обход останавливается досрочно (уже запущенные оценки ИИ доигрываются до конца)
  *
- * Возвращает { deals, scanned, found, gatedMidScan }, где deals — лоты, прошедшие
- * фильтр "аукционная цена минимум в 3 раза меньше рыночной, и разница — не меньше
- * 100€", с добавленными полями marketPrice/aiComment. gatedMidScan: true значит,
- * что скан прервался досрочно из-за потери доступа к ценам (см. GATED_STREAK_LIMIT
- * ниже) — результат в этом случае может быть неполным.
+ * Возвращает { deals, scanned, found, gatedMidScan, aiUnavailable }, где deals —
+ * лоты, прошедшие фильтр "аукционная цена минимум в 3 раза меньше рыночной, и
+ * разница — не меньше 100€", с добавленными полями marketPrice/aiComment.
+ * gatedMidScan: true значит, что скан прервался досрочно из-за потери доступа к
+ * ценам (см. GATED_STREAK_LIMIT ниже). aiUnavailable: true значит, что скан
+ * прервался из-за того, что ИИ перестал отвечать (лимит/баланс у провайдера,
+ * либо просто серия отказов подряд — см. AI_FAILURE_STREAK_LIMIT ниже). В обоих
+ * случаях результат может быть неполным.
  */
 export async function scrapeCategories(categories, cookieJar, options = {}) {
   const politeWait = options.politeWait || defaultPoliteWait;
@@ -150,8 +162,18 @@ export async function scrapeCategories(categories, cookieJar, options = {}) {
   const pendingAppraisals = [];
   let aiDispatched = 0;
   let aiDone = 0;
+  // Клиент может в будущем сменить провайдера ИИ — у каждого свой формат ошибки
+  // на исчерпанный лимит/баланс, и все заранее не предусмотришь. Поэтому кроме
+  // точечного распознавания уже известного формата (polza.ai, см. ниже) держим
+  // и универсальный детектор: если несколько запросов ПОДРЯД проваливаются
+  // (неважно, почему и в каком формате пришла ошибка) — считаем, что ИИ стал
+  // недоступен, и не тратим время на скрапинг остальных лотов впустую.
+  const AI_FAILURE_STREAK_LIMIT = 8; // с запасом больше уровня параллелизма (5)
+  let consecutiveAiFailures = 0;
+  let aiUnavailable = false;
 
   function queueAppraisal(lot) {
+    if (aiUnavailable) return;
     if (lot.price == null || !lot.mainPhoto) return; // без цены/фото оценивать нечего
     aiDispatched++;
     pendingAppraisals.push(
@@ -162,12 +184,19 @@ export async function scrapeCategories(categories, cookieJar, options = {}) {
             description: lot.description,
             mainPhoto: lot.mainPhoto,
           });
+          consecutiveAiFailures = 0;
           if (passesDealFilter(lot.price, marketPrice)) {
             deals.push({ ...lot, marketPrice, aiComment: comment });
           }
-        } catch {
-          // Ошибка ИИ по одному лоту не должна ронять весь скан — просто
-          // пропускаем этот лот, как и при ошибках скрапинга деталей.
+        } catch (err) {
+          if (err instanceof AIQuotaExceededError) {
+            aiUnavailable = true; // известный формат — реагируем сразу же, без ожидания серии
+          } else {
+            consecutiveAiFailures++;
+            if (consecutiveAiFailures >= AI_FAILURE_STREAK_LIMIT) aiUnavailable = true;
+          }
+          // Ошибку ИИ по одному лоту (кроме двух случаев выше) не считаем фатальной
+          // для всего скана — просто пропускаем этот лот, как и при ошибках скрапинга.
         } finally {
           aiDone++;
           onProgress({ stage: "appraising", done: aiDone, total: aiDispatched });
@@ -209,6 +238,7 @@ export async function scrapeCategories(categories, cookieJar, options = {}) {
       gatedMidScan = true;
       break;
     }
+    if (aiUnavailable) break;
     if (isCancelled()) break;
     await politeWait();
   }
@@ -218,5 +248,5 @@ export async function scrapeCategories(categories, cookieJar, options = {}) {
   // всё уже оценено, здесь лишь донидаем самый хвост.
   await Promise.all(pendingAppraisals);
 
-  return { deals, scanned, found: allLots.length, gatedMidScan };
+  return { deals, scanned, found: allLots.length, gatedMidScan, aiUnavailable };
 }

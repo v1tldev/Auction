@@ -212,6 +212,7 @@ async function startAnalysis(ctx, chatId, categories) {
   let loginFailed = false;
   let pricesGated = false;
   let gatedMidScan = false;
+  let aiUnavailable = false;
   try {
     const login = await loginAndGetSession(FAJANS_USER, FAJANS_PASS);
     if (!login.success) {
@@ -227,12 +228,20 @@ async function startAnalysis(ctx, chatId, categories) {
         pricesGated = true;
       } else {
         let lastEditAt = 0;
+        let lastStage = null;
         const result = await scrapeCategories(categories, login.cookieJar, {
           isCancelled: () => cancelToken.cancelled,
           async onProgress(p) {
             const now = Date.now();
-            if (now - lastEditAt < 2500) return; // не долбим Telegram API правками чаще раза в 2.5с
+            // Раньше троттлинг был общим на все три стадии ("список"/"детали"/
+            // "оценка ИИ") — а поскольку "детали" тикают чаще и равномернее, они
+            // почти всегда "выигрывали" 2.5-секундное окно, и сообщение про ИИ
+            // могло вообще не успеть показаться на небольшом разделе. Смена
+            // стадии теперь всегда пробивает троттлинг — сама стадия при этом
+            // всё равно не мельтешит чаще раза в 2.5с.
+            if (p.stage === lastStage && now - lastEditAt < 2500) return;
             lastEditAt = now;
+            lastStage = p.stage;
             const progressText =
               p.stage === "listing"
                 ? `Собираю список: ${p.name} — стр. ${p.page}/${p.totalPages}`
@@ -249,6 +258,7 @@ async function startAnalysis(ctx, chatId, categories) {
         deals = result.deals;
         scanned = result.scanned;
         gatedMidScan = result.gatedMidScan;
+        aiUnavailable = result.aiUnavailable;
       }
     }
   } catch (err) {
@@ -297,6 +307,8 @@ async function startAnalysis(ctx, chatId, categories) {
 
   const gatedNote = gatedMidScan
     ? "\n\n⚠️ Скан прервался раньше времени: аккаунт перестал видеть цены на середине (похоже, истекла сессия). Результат может быть неполным — попробуйте сканировать заново."
+    : aiUnavailable
+    ? "\n\n⚠️ Скан прервался раньше времени: ИИ ограничил доступ по ключу (закончился лимит или баланс). Результат может быть неполным — проверьте ключ ИИ у своего поставщика и попробуйте позже."
     : "";
 
   await finishScanning(

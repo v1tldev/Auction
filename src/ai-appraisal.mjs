@@ -22,6 +22,21 @@ const SYSTEM_PROMPT =
   '{"market_price": <число в евро, или null если оценить невозможно>, "comment": ' +
   '"<короткий комментарий на русском, 1-2 предложения, почему такая цена>"}.';
 
+// Отдельный тип ошибки для исчерпанного лимита/баланса на polza.ai — в отличие
+// от разовых сетевых сбоев, повторять запрос немедленно бессмысленно (лимит не
+// снимется за миллисекунды), и об этом нужно явно сказать в чате, а не молча
+// пропустить все лоты одним тихим 0.
+export class AIQuotaExceededError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "AIQuotaExceededError";
+  }
+}
+
+function isQuotaError(err) {
+  return err?.status === 402 || err?.code === "INSUFFICIENT_BALANCE" || err?.error?.code === "INSUFFICIENT_BALANCE";
+}
+
 async function requestAppraisal({ title, description, mainPhoto }) {
   const completion = await getClient().chat.completions.create({
     model: MODEL,
@@ -51,10 +66,17 @@ export async function appraiseLot(lot) {
   let parsed;
   try {
     parsed = await requestAppraisal(lot);
-  } catch {
-    // Одна повторная попытка — сетевые сбои/лимиты у polza.ai часто разовые,
-    // не хочется терять потенциально хороший лот из-за одного неудачного запроса.
-    parsed = await requestAppraisal(lot);
+  } catch (err) {
+    if (isQuotaError(err)) throw new AIQuotaExceededError(err.message);
+    // Одна повторная попытка — сетевые сбои у polza.ai часто разовые, не хочется
+    // терять потенциально хороший лот из-за одного неудачного запроса. Лимит
+    // баланса, в отличие от сетевого сбоя, повторной попыткой не лечится.
+    try {
+      parsed = await requestAppraisal(lot);
+    } catch (err2) {
+      if (isQuotaError(err2)) throw new AIQuotaExceededError(err2.message);
+      throw err2;
+    }
   }
   const marketPrice = typeof parsed.market_price === "number" ? parsed.market_price : null;
   const comment = typeof parsed.comment === "string" ? parsed.comment : "";
