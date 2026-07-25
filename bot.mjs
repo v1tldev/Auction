@@ -5,6 +5,7 @@ import { CATEGORIES } from "./src/categories.mjs";
 import { scrapeCategories, checkPricesVisible } from "./src/scrape-core.mjs";
 import { loginAndGetSession } from "./src/fajans-auth.mjs";
 import { getAccountOverride, setAccountOverride, clearAccountOverride } from "./src/account-store.mjs";
+import { saveLastResults, loadLastResults } from "./src/results-store.mjs";
 
 if (!process.env.BOT_TOKEN) {
   console.error("В .env не задан BOT_TOKEN — получите токен у @BotFather в Telegram и впишите его в .env");
@@ -19,6 +20,7 @@ const DEMO_PAGE_SIZE = 8;
 
 const SCAN_ALL_LABEL = "🔎 Сканировать";
 const DEMO_LABEL = "🧪 Демо-тест категории";
+const SHOW_LAST_LABEL = "📋 Результаты последнего сканирования";
 const ACCOUNT_LABEL = "👤 Сменить аккаунт";
 const CHANGE_CREDS_LABEL = "✏️ Сменить логин и пароль";
 const RESET_ACCOUNT_LABEL = "↩️ Поставить аккаунт по умолчанию";
@@ -62,6 +64,7 @@ function mainKeyboard() {
   return new Keyboard()
     .text(SCAN_ALL_LABEL).row()
     .text(DEMO_LABEL).row()
+    .text(SHOW_LAST_LABEL).row()
     .text(ACCOUNT_LABEL)
     .resized();
 }
@@ -97,12 +100,20 @@ function demoCategoryKeyboard(page) {
   return kb;
 }
 
+// Telegram не переносит текст кнопки на новую строку, а обрезает его —
+// длинные комбинации разделов (лот попал сразу в несколько категорий) иначе
+// обрезаются некрасиво посреди слова. Самое длинное ОДНО название раздела —
+// 46 символов, так что порог чуть выше режет только составные комбинации.
+function truncate(text, max) {
+  return text.length > max ? text.slice(0, max - 1).trimEnd() + "…" : text;
+}
+
 // groups: [[categoryName, lots[]], ...] — по кнопке на раздел, с количеством
 // отобранных ИИ лотов в каждом.
 function categoriesInlineKeyboard(groups) {
   const kb = new InlineKeyboard();
   groups.forEach(([name, lots], i) => {
-    kb.text(`${name} (${lots.length})`, `cat:${i}`).row();
+    kb.text(`${truncate(name, 48)} (${lots.length})`, `cat:${i}`).row();
   });
   return kb;
 }
@@ -270,6 +281,10 @@ async function startAnalysis(ctx, chatId, categories) {
   }
   const groups = [...groupsMap.entries()];
   sessions.set(chatId, { groups });
+  // Один клиент, один аукцион — сохраняем на диск, чтобы отдать эти же
+  // результаты повторно по кнопке "Показать результаты последнего сканирования",
+  // даже после перезапуска бота.
+  saveLastResults(groups);
 
   await finishScanning(
     ctx,
@@ -296,6 +311,16 @@ bot.on("message:text", async (ctx) => {
     }
     if (text === DEMO_LABEL) {
       await ctx.reply("Выберите раздел для демо-теста:", { reply_markup: demoCategoryKeyboard(0) });
+      return;
+    }
+    if (text === SHOW_LAST_LABEL) {
+      const groups = loadLastResults();
+      if (!groups || !groups.length) {
+        await ctx.reply("Пока нет сохранённых результатов — сначала запустите сканирование.");
+        return;
+      }
+      sessions.set(chatId, { groups });
+      await ctx.reply("Результаты последнего сканирования:", { reply_markup: categoriesInlineKeyboard(groups) });
       return;
     }
     if (text === ACCOUNT_LABEL) {

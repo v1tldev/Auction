@@ -121,7 +121,7 @@ export async function scrapeCategories(categories, cookieJar, options = {}) {
 
   // Один лот может относиться сразу к нескольким нужным нам разделам (например,
   // статуэтка из фарфора попадает и в "Фарфор", и в "Статуэтки") — дедуплицируем
-  // по id, объединяя названия разделов через запятую вместо дублей в выдаче.
+  // по id, объединяя названия разделов через " / " вместо дублей в выдаче.
   const lotsById = new Map();
   categoriesLoop: for (const { slug, name } of categories) {
     let totalPages = 1;
@@ -176,7 +176,7 @@ export async function scrapeCategories(categories, cookieJar, options = {}) {
 
   let scanned = 0;
   for (const [i, lot] of allLots.entries()) {
-    const category = lot.categories.join(", ");
+    const category = lot.categories.join(" / ");
     try {
       const detail = await scrapeLotDetail(lot.id, cookieJar);
       const result = {
