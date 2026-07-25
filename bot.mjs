@@ -127,11 +127,18 @@ function browseKeyboard(catIndex, index, total) {
     .text("⬅️ К разделам", "back");
 }
 
+// Telegram ограничивает подпись к фото 1024 символами (это меньше, чем 4096
+// для обычных текстовых сообщений) — при длинном названии лота и подробном
+// комментарии ИИ реальный текст мог превысить лимит, и Telegram отклонял
+// отправку фото целиком. Подрезаем с запасом, чтобы это не случалось.
+const CAPTION_MAX = 1000;
+
 function formatLot(lot) {
   const price = lot.price != null ? `${lot.price} €` : "цена скрыта";
   const market = lot.marketPrice != null ? `${lot.marketPrice} €` : "?";
   const comment = lot.aiComment ? `\n💬 ${lot.aiComment}` : "";
-  return `#${lot.id} [${lot.category}]\n${lot.title}\nЦена на аукционе: ${price}\nРыночная цена (оценка ИИ): ${market}${comment}\nhttps://www.fajans.lv/ru/auction/${lot.id}`;
+  const text = `#${lot.id} [${lot.category}]\n${lot.title}\nЦена на аукционе: ${price}\nРыночная цена (оценка ИИ): ${market}${comment}\nhttps://www.fajans.lv/ru/auction/${lot.id}`;
+  return text.length > CAPTION_MAX ? text.slice(0, CAPTION_MAX - 1) + "…" : text;
 }
 
 bot.command("start", async (ctx) => {
@@ -204,6 +211,7 @@ async function startAnalysis(ctx, chatId, categories) {
   let scanned = 0;
   let loginFailed = false;
   let pricesGated = false;
+  let gatedMidScan = false;
   try {
     const login = await loginAndGetSession(FAJANS_USER, FAJANS_PASS);
     if (!login.success) {
@@ -240,6 +248,7 @@ async function startAnalysis(ctx, chatId, categories) {
         });
         deals = result.deals;
         scanned = result.scanned;
+        gatedMidScan = result.gatedMidScan;
       }
     }
   } catch (err) {
@@ -286,12 +295,16 @@ async function startAnalysis(ctx, chatId, categories) {
   // даже после перезапуска бота.
   saveLastResults(groups);
 
+  const gatedNote = gatedMidScan
+    ? "\n\n⚠️ Скан прервался раньше времени: аккаунт перестал видеть цены на середине (похоже, истекла сессия). Результат может быть неполным — попробуйте сканировать заново."
+    : "";
+
   await finishScanning(
     ctx,
     chatId,
-    wasCancelled
+    (wasCancelled
       ? `Сканирование отменено. Успело собраться ${scanned} лотов, из них подходящих по цене — ${deals.length}.`
-      : `Готово! Отсканировано ${scanned} лотов, найдено подходящих по цене — ${deals.length}.`
+      : `Готово! Отсканировано ${scanned} лотов, найдено подходящих по цене — ${deals.length}.`) + gatedNote
   );
 
   if (groups.length) {
@@ -419,7 +432,12 @@ bot.callbackQuery(/^demopage:(-?\d+)$/, async (ctx) => {
   let page = Number(ctx.match[1]);
   if (page < 0) page = totalPages - 1;
   if (page >= totalPages) page = 0;
-  await ctx.editMessageReplyMarkup({ reply_markup: demoCategoryKeyboard(page) });
+  try {
+    await ctx.editMessageReplyMarkup({ reply_markup: demoCategoryKeyboard(page) });
+  } catch {
+    // клавиатура могла не измениться с прошлого раза (например, двойное нажатие
+    // одной и той же стрелки) — Telegram в этом случае просто отдаёт ошибку, игнорируем
+  }
 });
 
 bot.callbackQuery(/^demorun:(.+)$/, async (ctx) => {

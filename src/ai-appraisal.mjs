@@ -22,11 +22,7 @@ const SYSTEM_PROMPT =
   '{"market_price": <число в евро, или null если оценить невозможно>, "comment": ' +
   '"<короткий комментарий на русском, 1-2 предложения, почему такая цена>"}.';
 
-/**
- * Просит модель оценить лот по фото/названию/описанию.
- * Возвращает { marketPrice: number|null, comment: string }.
- */
-export async function appraiseLot({ title, description, mainPhoto }) {
+async function requestAppraisal({ title, description, mainPhoto }) {
   const completion = await getClient().chat.completions.create({
     model: MODEL,
     messages: [
@@ -44,7 +40,22 @@ export async function appraiseLot({ title, description, mainPhoto }) {
   });
 
   const raw = completion.choices[0]?.message?.content ?? "{}";
-  const parsed = JSON.parse(raw);
+  return JSON.parse(raw);
+}
+
+/**
+ * Просит модель оценить лот по фото/названию/описанию.
+ * Возвращает { marketPrice: number|null, comment: string }.
+ */
+export async function appraiseLot(lot) {
+  let parsed;
+  try {
+    parsed = await requestAppraisal(lot);
+  } catch {
+    // Одна повторная попытка — сетевые сбои/лимиты у polza.ai часто разовые,
+    // не хочется терять потенциально хороший лот из-за одного неудачного запроса.
+    parsed = await requestAppraisal(lot);
+  }
   const marketPrice = typeof parsed.market_price === "number" ? parsed.market_price : null;
   const comment = typeof parsed.comment === "string" ? parsed.comment : "";
   return { marketPrice, comment };

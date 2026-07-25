@@ -109,9 +109,11 @@ function createLimiter(concurrency) {
  * options.isCancelled: функция () => boolean — проверяется между запросами; при true
  *   обход останавливается досрочно (уже запущенные оценки ИИ доигрываются до конца)
  *
- * Возвращает { deals, scanned, found }, где deals — лоты, прошедшие фильтр
- * "аукционная цена минимум в 3 раза меньше рыночной, и разница — не меньше 100€",
- * с добавленными полями marketPrice/aiComment.
+ * Возвращает { deals, scanned, found, gatedMidScan }, где deals — лоты, прошедшие
+ * фильтр "аукционная цена минимум в 3 раза меньше рыночной, и разница — не меньше
+ * 100€", с добавленными полями marketPrice/aiComment. gatedMidScan: true значит,
+ * что скан прервался досрочно из-за потери доступа к ценам (см. GATED_STREAK_LIMIT
+ * ниже) — результат в этом случае может быть неполным.
  */
 export async function scrapeCategories(categories, cookieJar, options = {}) {
   const politeWait = options.politeWait || defaultPoliteWait;
@@ -174,11 +176,21 @@ export async function scrapeCategories(categories, cookieJar, options = {}) {
     );
   }
 
+  // Скан всех разделов может идти очень долго (тысячи лотов) — если сессия
+  // fajans.lv протухнет посреди него, каждый следующий лот молча вернётся с
+  // gated:true (цена скрыта), и без этой проверки скан бы тихо доехал до конца
+  // с сильно неполным результатом, не предупредив, что что-то сломалось.
+  // Несколько гейтов подряд — явный признак именно этого, а не случайности.
+  const GATED_STREAK_LIMIT = 5;
+  let consecutiveGated = 0;
+  let gatedMidScan = false;
+
   let scanned = 0;
   for (const [i, lot] of allLots.entries()) {
     const category = lot.categories.join(" / ");
     try {
       const detail = await scrapeLotDetail(lot.id, cookieJar);
+      consecutiveGated = detail.gated ? consecutiveGated + 1 : 0;
       const result = {
         id: lot.id,
         category,
@@ -193,6 +205,10 @@ export async function scrapeCategories(categories, cookieJar, options = {}) {
       // Ошибку скрапинга одного лота не считаем фатальной — просто пропускаем его.
     }
     onProgress({ stage: "detail", index: i + 1, total: allLots.length });
+    if (consecutiveGated >= GATED_STREAK_LIMIT) {
+      gatedMidScan = true;
+      break;
+    }
     if (isCancelled()) break;
     await politeWait();
   }
@@ -202,5 +218,5 @@ export async function scrapeCategories(categories, cookieJar, options = {}) {
   // всё уже оценено, здесь лишь донидаем самый хвост.
   await Promise.all(pendingAppraisals);
 
-  return { deals, scanned, found: allLots.length };
+  return { deals, scanned, found: allLots.length, gatedMidScan };
 }
