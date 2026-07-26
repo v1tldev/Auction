@@ -1,11 +1,14 @@
 import "dotenv/config";
 import { Bot, Keyboard, InlineKeyboard } from "grammy";
 import { run } from "@grammyjs/runner";
+import { autoRetry } from "@grammyjs/auto-retry";
+import { apiThrottler } from "@grammyjs/transformer-throttler";
 import { CATEGORIES } from "./src/categories.mjs";
 import { scrapeCategories, checkPricesVisible } from "./src/scrape-core.mjs";
 import { loginAndGetSession } from "./src/fajans-auth.mjs";
 import { getAccountOverride, setAccountOverride, clearAccountOverride } from "./src/account-store.mjs";
 import { saveLastResults, loadLastResults } from "./src/results-store.mjs";
+import { saveAiCache } from "./src/ai-cache.mjs";
 
 if (!process.env.BOT_TOKEN) {
   console.error("В .env не задан BOT_TOKEN — получите токен у @BotFather в Telegram и впишите его в .env");
@@ -13,6 +16,20 @@ if (!process.env.BOT_TOKEN) {
 }
 
 const bot = new Bot(process.env.BOT_TOKEN);
+
+// autoRetry: при 429 Too Many Requests Telegram присылает retry_after, и раньше
+// такой запрос просто терялся вместе с сообщением (именно так до клиента не
+// доходил финальный отчёт о сканировании). Теперь grammy сам подождёт и повторит.
+// maxDelaySeconds ограничивает ожидание минутой: если Telegram затыкает бота на
+// 20 минут, ждать столько внутри запроса бессмысленно — лучше отдать ошибку,
+// увидеть её в логе и разбираться с причиной.
+bot.api.config.use(autoRetry({ maxRetryAttempts: 3, maxDelaySeconds: 60 }));
+
+// apiThrottler — страховка от флуд-бана на будущее: сам по себе выдерживает лимит
+// Telegram (~1 запрос в секунду на чат) и ставит лишние вызовы в очередь вместо
+// того, чтобы получать по ним 429. Даже если в коде когда-нибудь снова появится
+// место, которое спамит сообщениями, до бана дело уже не дойдёт.
+bot.api.config.use(apiThrottler());
 
 // Сколько разделов показывать на одной странице инлайн-клавиатуры выбора
 // демо-раздела — весь список (23 штуки) не влезет в один экран без пролистывания.
@@ -33,35 +50,84 @@ const CANCEL_LABEL = "❌ Отменить сканирование";
 // и pendingUsername — логин, введённый на предыдущем шаге смены аккаунта,
 // пока ждём пароль вторым сообщением.
 const uiState = new Map(); // chatId -> { mode, lastMessageId, pendingUsername }
-// Флаги отмены для запущенных сканирований.
+// Флаги отмены для запущенных сканирований. Заодно служит признаком "в этом чате
+// скан уже идёт" — второй одновременный скан не запускается (см. startAnalysis).
 const runningScans = new Map(); // chatId -> { cancelled: boolean }
 // Результаты последнего анализа: { groups } — groups: [[categoryName, lots[]], ...].
 const sessions = new Map();
 
-// Сторожевой таймер на случай зависания скана по ЛЮБОЙ непредвиденной причине
-// (сеть, сторонний сервис, что угодно, что мы не предусмотрели явно). Пока идёт
-// скан, каждое событие прогресса обновляет watchdogLastProgress; если прогресса
-// нет дольше STALL_TIMEOUT_MS — считаем процесс зависшим, пишем об этом в чат
-// и завершаемся, чтобы pm2 перезапустил бота начисто.
-const STALL_TIMEOUT_MS = 10 * 60 * 1000; // 10 минут без прогресса
-let watchdogChatId = null;
-let watchdogLastProgress = null;
+// --- логирование ---
 
-setInterval(async () => {
-  if (watchdogLastProgress === null) return; // сейчас ничего не сканируется
-  if (Date.now() - watchdogLastProgress < STALL_TIMEOUT_MS) return;
-  const chatId = watchdogChatId;
-  console.error(`Скан завис (нет прогресса дольше ${STALL_TIMEOUT_MS / 60000} минут) — перезапускаю процесс.`);
-  try {
-    await bot.api.sendMessage(
-      chatId,
-      `⚠️ Сканирование зависло (нет прогресса больше ${STALL_TIMEOUT_MS / 60000} минут) — перезапускаю бота. ` +
-        "Через минуту попробуйте запустить сканирование заново."
-    );
-  } catch {
-    // не получилось отправить — не страшно, перезапускаемся в любом случае
+// grammy кладёт в объект ошибки (BotError) весь ctx, а внутри ctx лежит
+// ctx.api.token — из-за этого console.error(err) целиком выписывал BOT_TOKEN в
+// открытом виде в лог pm2, который читает любой, у кого есть доступ к серверу.
+// Поэтому: (1) логируем только осмысленные поля ошибки, а не объект целиком,
+// (2) на всякий случай прогоняем всё, что уходит в лог и в чат, через scrub().
+const TOKEN = process.env.BOT_TOKEN;
+function scrub(text) {
+  const s = String(text ?? "");
+  return TOKEN ? s.split(TOKEN).join("<BOT_TOKEN>") : s;
+}
+
+function describeError(err) {
+  const e = err?.error ?? err;
+  const parts = [scrub(e?.description || e?.message || e)];
+  if (e?.error_code === 429) {
+    parts.push(`(429 Too Many Requests, retry_after=${e?.parameters?.retry_after ?? "?"}с)`);
+  } else if (e?.error_code) {
+    parts.push(`(код ${e.error_code})`);
   }
-  process.exit(1);
+  return parts.join(" ");
+}
+
+function logError(prefix, err) {
+  console.error(`${prefix}: ${describeError(err)}`);
+  const stack = (err?.error ?? err)?.stack;
+  if (stack) console.error(scrub(stack).split("\n").slice(1, 4).join("\n"));
+}
+
+// --- сторожевой таймер ---
+
+// Страховка на случай зависания скана по ЛЮБОЙ непредвиденной причине (сеть,
+// сторонний сервис, что угодно, что мы не предусмотрели явно). Пока идёт скан,
+// каждое событие прогресса обновляет отметку времени по своему чату; если
+// прогресса нет дольше STALL_TIMEOUT_MS — считаем процесс зависшим, пишем об
+// этом в чат и завершаемся, чтобы pm2 перезапустил бота начисто.
+//
+// Отметки лежат в Map по чатам, а не в двух глобальных переменных: с
+// глобальными второй запущенный скан затирал отметку первого, а тот из них,
+// который заканчивался раньше, вообще выключал сторожа для всё ещё
+// работающего скана.
+const STALL_TIMEOUT_MS = 10 * 60 * 1000; // 10 минут без прогресса
+const watchdogs = new Map(); // chatId -> время последнего события прогресса
+
+function watchdogTouch(chatId) {
+  watchdogs.set(chatId, Date.now());
+}
+function watchdogEnd(chatId) {
+  watchdogs.delete(chatId);
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [chatId, lastProgressAt] of watchdogs) {
+    if (now - lastProgressAt < STALL_TIMEOUT_MS) continue;
+    const minutes = STALL_TIMEOUT_MS / 60000;
+    console.error(`Скан завис (нет прогресса дольше ${minutes} минут) — перезапускаю процесс.`);
+    saveAiCache(); // не теряем уже сделанные ИИ-оценки
+    // Ждём отправки предупреждения, но не дольше 10 секунд — перезапуститься
+    // нужно в любом случае.
+    setTimeout(() => process.exit(1), 10000).unref();
+    bot.api
+      .sendMessage(
+        chatId,
+        `⚠️ Сканирование зависло (нет прогресса больше ${minutes} минут) — перезапускаю бота. ` +
+          "Через минуту попробуйте запустить сканирование заново."
+      )
+      .catch(() => {}) // не получилось отправить — не страшно, перезапускаемся в любом случае
+      .then(() => process.exit(1));
+    return;
+  }
 }, 60000);
 
 function getState(chatId) {
@@ -176,12 +242,24 @@ function formatLot(lot) {
   const market = lot.marketPrice != null ? `${lot.marketPrice} €` : "?";
   const comment = lot.aiComment ? `\n💬 ${lot.aiComment}` : "";
   const text = `#${lot.id} [${lot.category}]\n${lot.title}\nЦена на аукционе: ${price}\nРыночная цена (оценка ИИ): ${market}${comment}\nhttps://www.fajans.lv/ru/auction/${lot.id}`;
-  return text.length > CAPTION_MAX ? text.slice(0, CAPTION_MAX - 1) + "…" : text;
+  // Режем по границе слова, а не посреди него.
+  return text.length > CAPTION_MAX ? text.slice(0, CAPTION_MAX - 1).replace(/\s+\S*$/, "") + "…" : text;
 }
 
 bot.command("start", async (ctx) => {
   const chatId = ctx.chat.id;
-  getState(chatId).mode = "main";
+  const state = getState(chatId);
+  // /start посреди скана раньше сбрасывал режим в "main", и следующим нажатием
+  // «Сканировать» клиент запускал ВТОРОЙ скан параллельно первому — двойная
+  // нагрузка на fajans.lv, двойной поток правок в Telegram и потерянный токен
+  // отмены первого скана. Теперь во время скана режим не трогаем.
+  if (runningScans.has(chatId)) {
+    await ctx.reply(
+      `Сейчас идёт сканирование — дождитесь его окончания или нажмите «${CANCEL_LABEL}», чтобы остановить.`
+    );
+    return;
+  }
+  state.mode = "main";
   await showScreen(
     ctx,
     chatId,
@@ -199,16 +277,77 @@ async function finishScanning(ctx, chatId, text) {
   await showScreen(ctx, chatId, text, mainKeyboard());
 }
 
+// Одна строка статуса на ВСЕ стадии скана. Раньше строк было три (список /
+// детали / оценка ИИ), стадии чередовались, и троттлинг, который сбрасывался
+// при смене стадии, не работал вообще: бот отправлял ~2 правки в секунду и
+// получал от Telegram флуд-бан на 20+ минут — именно это клиент видел как
+// "бот умер и перестал отвечать".
+function renderProgress(p) {
+  if (p.stage === "listing") {
+    return `Собираю списки лотов: раздел ${p.done}/${p.total}, найдено — ${p.lots}`;
+  }
+  const parts = [`Обрабатываю лоты: ${p.index}/${p.total}`];
+  if (p.aiTotal) parts.push(`оценка ИИ: ${p.aiDone}/${p.aiTotal}`);
+  if (p.cached) parts.push(`из кэша: ${p.cached}`);
+  return parts.join(" · ");
+}
+
+// Лимит Telegram — примерно 1 сообщение в секунду на чат, а скан длится десятки
+// минут, так что правка раз в 5 секунд — единственный безопасный режим (это ~180
+// правок за скан вместо прежних ~5500).
+const PROGRESS_MIN_INTERVAL_MS = 5000;
+
+function scanSummary(result, wasCancelled) {
+  const head = wasCancelled
+    ? `Сканирование отменено. Успело обработаться ${result.scanned} лотов из ${result.found}`
+    : `Готово! Обработано ${result.scanned} лотов`;
+  const lines = [`${head}, из них подходящих по цене — ${result.deals.length}.`];
+
+  const notes = [];
+  if (result.cached) notes.push(`${result.cached} оценок взято из кэша (без запроса к ИИ)`);
+  const hidden = result.scanned - result.priced;
+  if (hidden > 0) notes.push(`у ${hidden} лотов цена была скрыта`);
+  if (result.failed) notes.push(`${result.failed} лотов не открылись`);
+  if (notes.length) lines.push(notes.join(", ") + ".");
+
+  return lines.join("\n");
+}
+
+// Обёртка над сканом: гарантирует, что чат вернётся в рабочее состояние ЧТО БЫ НИ
+// СЛУЧИЛОСЬ. Раньше здесь был try/finally без catch, и любая ошибка Telegram-API
+// (например, отказ отправить финальное сообщение из-за флуд-бана) оставляла чат
+// в режиме "scanning" навсегда: обработчик текста в этом режиме молча игнорирует
+// всё, кроме кнопки отмены, поэтому бот выглядел полностью мёртвым.
 async function startAnalysis(ctx, chatId, categories) {
+  if (runningScans.has(chatId)) {
+    await ctx.reply(`Сканирование уже идёт — дождитесь окончания или нажмите «${CANCEL_LABEL}».`);
+    return;
+  }
+
   const state = getState(chatId);
-  state.mode = "scanning";
   const cancelToken = { cancelled: false };
   runningScans.set(chatId, cancelToken);
-  watchdogChatId = chatId;
-  watchdogLastProgress = Date.now();
+  state.mode = "scanning";
+  watchdogTouch(chatId);
 
   try {
+    await runScan(ctx, chatId, categories, cancelToken);
+  } catch (err) {
+    logError("Сканирование прервано ошибкой", err);
+    try {
+      await finishScanning(ctx, chatId, `Сканирование прервано из-за ошибки: ${scrub(err?.message)}`);
+    } catch (replyErr) {
+      logError("Не удалось сообщить в чат об ошибке сканирования", replyErr);
+    }
+  } finally {
+    runningScans.delete(chatId);
+    watchdogEnd(chatId);
+    state.mode = "main";
+    saveAiCache();
+  }
+}
 
+async function runScan(ctx, chatId, categories, cancelToken) {
   // При скане всех категорий список из 23 названий в чате только мешает —
   // пишем просто "по всем категориям". Для демо-теста (один раздел) название
   // всё же полезно показать, чтобы было видно, что за раздел проверяется.
@@ -222,10 +361,9 @@ async function startAnalysis(ctx, chatId, categories) {
   // что показывает кнопку отмены: Telegram запрещает редактировать текст
   // сообщения, отправленного вместе с ReplyKeyboardMarkup — editMessageText
   // на такое сообщение стабильно падает с 400 "message can't be edited".
-  // Раньше это молча проглатывалось пустым catch{}, из-за чего прогресс
-  // никогда не отображался, хотя сбор данных на самом деле шёл.
   const progressMsg = await ctx.reply("Собираю данные...");
   const progressMessageId = progressMsg.message_id;
+  const clearProgress = () => ctx.api.deleteMessage(chatId, progressMessageId).catch(() => {});
 
   // Свой аккаунт (если клиент его задал через "Сменить аккаунт") приоритетнее
   // дефолтного из .env — так у каждого чата может быть свой fajans.lv-логин.
@@ -234,93 +372,31 @@ async function startAnalysis(ctx, chatId, categories) {
   const FAJANS_PASS = override?.password ?? process.env.FAJANS_PASS;
   const { API_KEY } = process.env;
   if (!FAJANS_USER || !FAJANS_PASS) {
-    runningScans.delete(chatId);
-    await ctx.api.deleteMessage(chatId, progressMessageId).catch(() => {});
+    await clearProgress();
     await finishScanning(ctx, chatId, "В .env не заданы FAJANS_USER / FAJANS_PASS.");
     return;
   }
   if (!API_KEY) {
-    runningScans.delete(chatId);
-    await ctx.api.deleteMessage(chatId, progressMessageId).catch(() => {});
+    await clearProgress();
     await finishScanning(ctx, chatId, "В .env не задан API_KEY (ключ для оценки ИИ через polza.ai).");
     return;
   }
 
-  // Любая ошибка внутри (сеть, разлогинило сессию и т.п.) раньше "проглатывалась"
-  // необработанным исключением — чат молчал, а режим навсегда застревал на
-  // "сканирование". Теперь при сбое явно показываем причину и возвращаемся в меню.
-  let deals = [];
-  let scanned = 0;
-  let loginFailed = false;
-  let pricesGated = false;
-  let gatedMidScan = false;
-  let aiUnavailable = false;
-  try {
-    const login = await loginAndGetSession(FAJANS_USER, FAJANS_PASS);
-    if (!login.success) {
-      loginFailed = true;
-    } else {
-      // Аккаунт может формально залогиниться (куки, редирект), но при этом не
-      // видеть цены — например, если он не прошёл модерацию на сайте. Раньше
-      // это тихо приводило к "0 сделок найдено" без объяснений: скан проходил
-      // весь список лотов, а фильтр молча пропускал их все из-за отсутствия
-      // цены. Теперь проверяем доступ к ценам ДО полного скана.
-      const access = await checkPricesVisible(categories, login.cookieJar);
-      if (access.visible === false) {
-        pricesGated = true;
-      } else {
-        let lastEditAt = 0;
-        let lastStage = null;
-        const result = await scrapeCategories(categories, login.cookieJar, {
-          isCancelled: () => cancelToken.cancelled,
-          async onProgress(p) {
-            watchdogLastProgress = Date.now(); // отмечаем сразу, до троттлинга UI ниже
-            const now = Date.now();
-            // Раньше троттлинг был общим на все три стадии ("список"/"детали"/
-            // "оценка ИИ") — а поскольку "детали" тикают чаще и равномернее, они
-            // почти всегда "выигрывали" 2.5-секундное окно, и сообщение про ИИ
-            // могло вообще не успеть показаться на небольшом разделе. Смена
-            // стадии теперь всегда пробивает троттлинг — сама стадия при этом
-            // всё равно не мельтешит чаще раза в 2.5с.
-            if (p.stage === lastStage && now - lastEditAt < 2500) return;
-            lastEditAt = now;
-            lastStage = p.stage;
-            const progressText =
-              p.stage === "listing"
-                ? `Собираю список: ${p.name} — стр. ${p.page}/${p.totalPages}`
-                : p.stage === "detail"
-                ? `Собираю данные по лотам: ${p.index}/${p.total}`
-                : `Оцениваю через ИИ: ${p.done}/${p.total}`;
-            try {
-              await ctx.api.editMessageText(chatId, progressMessageId, progressText);
-            } catch {
-              // сообщение могло не измениться с прошлой правки — Telegram в этом случае просто отдаёт ошибку, игнорируем
-            }
-          },
-        });
-        deals = result.deals;
-        scanned = result.scanned;
-        gatedMidScan = result.gatedMidScan;
-        aiUnavailable = result.aiUnavailable;
-      }
-    }
-  } catch (err) {
-    console.error("Ошибка при сканировании:", err);
-    runningScans.delete(chatId);
-    await ctx.api.deleteMessage(chatId, progressMessageId).catch(() => {});
-    await finishScanning(ctx, chatId, `Сканирование прервано из-за ошибки: ${err.message}`);
-    return;
-  }
-
-  await ctx.api.deleteMessage(chatId, progressMessageId).catch(() => {});
-
-  runningScans.delete(chatId);
-
-  if (loginFailed) {
+  const login = await loginAndGetSession(FAJANS_USER, FAJANS_PASS);
+  if (!login.success) {
+    await clearProgress();
     await finishScanning(ctx, chatId, "Не удалось залогиниться на fajans.lv.");
     return;
   }
-  if (pricesGated) {
+
+  // Аккаунт может формально залогиниться (куки, редирект), но при этом не
+  // видеть цены — например, если он не прошёл модерацию на сайте. Раньше
+  // это тихо приводило к "0 сделок найдено" без объяснений: скан проходил
+  // весь список лотов, а фильтр молча пропускал их все из-за отсутствия
+  // цены. Поэтому проверяем доступ к ценам ДО полного скана.
+  const access = await checkPricesVisible(categories, login.cookieJar);
+  if (access.visible === false) {
+    await clearProgress();
     await finishScanning(
       ctx,
       chatId,
@@ -330,35 +406,75 @@ async function startAnalysis(ctx, chatId, categories) {
     return;
   }
 
-  const wasCancelled = cancelToken.cancelled;
+  let lastEditAt = 0;
+  let lastProgressText = null;
+  let editInFlight = false;
 
-  const groups = groupDealsByCategory(deals);
+  const result = await scrapeCategories(categories, login.cookieJar, {
+    isCancelled: () => cancelToken.cancelled,
+    // Скан идёт долго, и сессия fajans.lv может успеть истечь — тогда скрапер
+    // просит перелогиниться вместо того, чтобы оборвать скан с неполным результатом.
+    relogin: async () => {
+      const fresh = await loginAndGetSession(FAJANS_USER, FAJANS_PASS);
+      return fresh.success ? fresh.cookieJar : null;
+    },
+    async onProgress(p) {
+      watchdogTouch(chatId); // отмечаем сразу, до троттлинга UI ниже
+      const text = renderProgress(p);
+      // Правка тем же текстом Telegram всё равно отклоняется ошибкой — не тратим на неё запрос.
+      if (text === lastProgressText) return;
+      if (Date.now() - lastEditAt < PROGRESS_MIN_INTERVAL_MS) return;
+      // Предыдущая правка ещё не доехала (Telegram тормозит или ждёт retry_after) —
+      // не копим очередь запросов, пропускаем этот тик.
+      if (editInFlight) return;
+
+      lastEditAt = Date.now();
+      lastProgressText = text;
+      editInFlight = true;
+      try {
+        await ctx.api.editMessageText(chatId, progressMessageId, text);
+      } catch (err) {
+        // Раньше здесь стоял пустой catch {}, и он молча съедал сотни ошибок 429 —
+        // из-за этого настоящая причина ("бот сам загнал себя во флуд-бан") вообще
+        // не была видна в логах. Теперь всё, кроме безобидного "message is not
+        // modified", попадает в лог.
+        const e = err?.error ?? err;
+        if (!/message is not modified/i.test(e?.description ?? "")) {
+          logError("Не удалось обновить сообщение с прогрессом", err);
+        }
+      } finally {
+        editInFlight = false;
+      }
+    },
+  });
+
+  await clearProgress();
+
+  const groups = groupDealsByCategory(result.deals);
   sessions.set(chatId, { groups });
   // Один клиент, один аукцион — сохраняем на диск, чтобы отдать эти же
   // результаты повторно по кнопке "Показать результаты последнего сканирования",
   // даже после перезапуска бота.
-  saveLastResults(groups);
+  try {
+    saveLastResults(groups);
+  } catch (err) {
+    // Не смогли записать файл — результаты всё равно уже в памяти чата, так что
+    // просто пишем в лог и продолжаем.
+    logError("Не удалось сохранить результаты сканирования на диск", err);
+  }
 
-  const gatedNote = gatedMidScan
-    ? "\n\n⚠️ Скан прервался раньше времени: аккаунт перестал видеть цены на середине (похоже, истекла сессия). Результат может быть неполным — попробуйте сканировать заново."
-    : aiUnavailable
-    ? "\n\n⚠️ Скан прервался раньше времени: ИИ ограничил доступ по ключу (закончился лимит или баланс). Результат может быть неполным — проверьте ключ ИИ у своего поставщика и попробуйте позже."
+  const gatedNote = result.gatedMidScan
+    ? "\n\n⚠️ Скан прервался раньше времени: аккаунт перестал видеть цены и перелогиниться не удалось. Результат может быть неполным — попробуйте сканировать заново."
+    : result.aiUnavailable
+    ? "\n\n⚠️ Скан прервался раньше времени: ИИ перестал отвечать (закончился лимит или баланс по ключу). Результат может быть неполным — проверьте ключ ИИ у своего поставщика и попробуйте позже."
     : "";
 
-  await finishScanning(
-    ctx,
-    chatId,
-    (wasCancelled
-      ? `Сканирование отменено. Успело собраться ${scanned} лотов, из них подходящих по цене — ${deals.length}.`
-      : `Готово! Отсканировано ${scanned} лотов, найдено подходящих по цене — ${deals.length}.`) + gatedNote
-  );
+  await finishScanning(ctx, chatId, scanSummary(result, cancelToken.cancelled) + gatedNote);
 
   if (groups.length) {
-    await ctx.reply("Выберите раздел, чтобы посмотреть отобранные лоты:", { reply_markup: categoriesInlineKeyboard(groups) });
-  }
-  } finally {
-    watchdogChatId = null;
-    watchdogLastProgress = null;
+    await ctx.reply("Выберите раздел, чтобы посмотреть отобранные лоты:", {
+      reply_markup: categoriesInlineKeyboard(groups),
+    });
   }
 }
 
@@ -395,6 +511,11 @@ bot.on("message:text", async (ctx) => {
       await showScreen(ctx, chatId, `${status}\n\nЧто сделать?`, accountMenuKeyboard());
       return;
     }
+    // Любое другое сообщение — просто показываем меню заново. Это ещё и страховка:
+    // если у клиента на экране осталась старая клавиатура (например, с кнопкой
+    // отмены после сбоя), бот на любое нажатие ответит рабочим главным меню, а не
+    // будет молчать.
+    await showScreen(ctx, chatId, "Главное меню.", mainKeyboard());
     return;
   }
 
@@ -447,8 +568,22 @@ bot.on("message:text", async (ctx) => {
     await ctx.api.deleteMessage(chatId, ctx.message.message_id).catch(() => {});
 
     await ctx.reply("Проверяю логин и пароль на fajans.lv...");
-    const login = await loginAndGetSession(username, password);
     state.mode = "main";
+    let login;
+    try {
+      login = await loginAndGetSession(username, password);
+    } catch (err) {
+      // Сеть могла отвалиться — раньше это исключение оставляло режим на
+      // "awaiting_password", и следующее сообщение клиента бот принимал за пароль.
+      logError("Проверка логина на fajans.lv не удалась", err);
+      await showScreen(
+        ctx,
+        chatId,
+        `Не получилось проверить логин (${scrub(err?.message)}). Аккаунт не изменён, попробуйте ещё раз.`,
+        mainKeyboard()
+      );
+      return;
+    }
     if (!login.success) {
       await showScreen(
         ctx,
@@ -470,6 +605,11 @@ bot.on("message:text", async (ctx) => {
       if (token && !token.cancelled) {
         token.cancelled = true;
         await ctx.reply("Останавливаю сканирование, подождите...");
+      } else {
+        // Режим "scanning", а скана нет — значит он только что закончился, и
+        // финальное сообщение вот-вот придёт. Молчать нельзя: клиент решит, что
+        // бот мёртв.
+        await ctx.reply("Сканирование уже завершается, подождите пару секунд.");
       }
     }
     return;
@@ -494,6 +634,9 @@ bot.callbackQuery(/^demorun:(.+)$/, async (ctx) => {
   await ctx.answerCallbackQuery();
   const category = CATEGORIES.find((c) => c.slug === ctx.match[1]);
   if (!category) return;
+  // Инлайн-клавиатура демо-теста остаётся живой в истории чата навсегда, так что
+  // сюда легко попасть посреди уже идущего скана — от второго параллельного скана
+  // защищает проверка внутри startAnalysis.
   await startAnalysis(ctx, ctx.chat.id, [category]);
 });
 
@@ -516,7 +659,7 @@ bot.callbackQuery(/^cat:(\d+)$/, async (ctx) => {
   try {
     await ctx.replyWithPhoto(lot.mainPhoto, { caption, reply_markup: keyboard });
   } catch (err) {
-    await ctx.reply(`Не удалось показать фото лота #${lot.id}: ${err.message}`);
+    await ctx.reply(`Не удалось показать фото лота #${lot.id}: ${scrub(err?.message)}`);
   }
 });
 
@@ -550,7 +693,7 @@ bot.callbackQuery(/^browse:(\d+):(-?\d+)$/, async (ctx) => {
       await ctx.replyWithPhoto(lot.mainPhoto, { caption, reply_markup: keyboard });
     }
   } catch (err) {
-    await ctx.reply(`Не удалось показать фото лота #${lot.id}: ${err.message}`);
+    await ctx.reply(`Не удалось показать фото лота #${lot.id}: ${scrub(err?.message)}`);
   }
 });
 
@@ -562,15 +705,46 @@ bot.callbackQuery("back", async (ctx) => {
     await ctx.reply("Сначала запустите анализ.");
     return;
   }
-  await ctx.reply("Выберите раздел, чтобы посмотреть отобранные лоты:", { reply_markup: categoriesInlineKeyboard(session.groups) });
+  await ctx.reply("Выберите раздел, чтобы посмотреть отобранные лоты:", {
+    reply_markup: categoriesInlineKeyboard(session.groups),
+  });
 });
 
 bot.callbackQuery("noop", (ctx) => ctx.answerCallbackQuery());
 
-bot.catch((err) => console.error("Ошибка бота:", err));
+bot.catch((err) => {
+  // Печатаем ТОЛЬКО безопасные поля: err целиком содержит ctx, а в нём — ctx.api.token.
+  const updateId = err?.ctx?.update?.update_id;
+  logError(`Ошибка бота${updateId ? ` (update ${updateId})` : ""}`, err);
+});
+
+// Необработанный rejection/исключение вне middleware grammy убивало процесс без
+// единой строчки в логе — и бот "умирал" молча. Логируем причину и выходим сами,
+// чтобы pm2 поднял процесс заново.
+process.on("unhandledRejection", (reason) => {
+  logError("Необработанный rejection — перезапускаю процесс", reason);
+  saveAiCache();
+  process.exit(1);
+});
+process.on("uncaughtException", (err) => {
+  logError("Необработанное исключение — перезапускаю процесс", err);
+  saveAiCache();
+  process.exit(1);
+});
+
+// pm2 при перезапуске/деплое присылает SIGINT — успеваем сохранить кэш ИИ-оценок,
+// иначе оценки, сделанные после последнего сброса на диск, пришлось бы заказывать
+// у ИИ заново.
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () => {
+    console.log(`Получен ${signal} — сохраняю кэш ИИ-оценок и выхожу.`);
+    saveAiCache();
+    process.exit(0);
+  });
+}
 
 // Обычный bot.start() обрабатывает апдейты СТРОГО ПОСЛЕДОВАТЕЛЬНО: пока не
-// завершится текущий обработчик (а "Начать анализ" ждёт весь скан целиком,
+// завершится текущий обработчик (а сканирование ждёт весь скан целиком,
 // иногда десятки минут), бот вообще не смотрит на новые сообщения — поэтому
 // "Отменить" молча вставало в очередь и обрабатывалось только после того, как
 // скан уже сам закончился. @grammyjs/runner обрабатывает апдейты параллельно,
@@ -595,20 +769,21 @@ async function startBot() {
       process.exit(1);
     },
     (err) => {
-      console.error("Раннер обновлений упал с ошибкой — перезапускаю процесс:", err);
+      logError("Раннер обновлений упал с ошибкой — перезапускаю процесс", err);
       process.exit(1);
     }
   );
 }
 
 startBot().catch((err) => {
-  if (err?.error_code === 409 || /conflict/i.test(err?.description ?? "")) {
+  const e = err?.error ?? err;
+  if (e?.error_code === 409 || /conflict/i.test(e?.description ?? "")) {
     console.error(
       "409 Conflict: похоже, где-то уже запущен ещё один процесс с этим же BOT_TOKEN " +
       "(например, забытый фоновый запуск). Останови все остальные `node bot.mjs` и запусти заново."
     );
   } else {
-    console.error("Не удалось запустить бота:", err);
+    logError("Не удалось запустить бота", err);
   }
   process.exit(1);
 });

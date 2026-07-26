@@ -1,18 +1,48 @@
 Auction/
-├── .env                        ← ваши секреты (FAJANS_USER/PASS, BOT_TOKEN)
+├── .env                        ← секреты: FAJANS_USER/FAJANS_PASS, BOT_TOKEN, API_KEY
 ├── .gitignore
-├── package.json                ← добавил npm run scrape / npm run bot
+├── package.json                ← npm run scrape / npm run bot
 ├── package-lock.json
 ├── node_modules/
-├── scraper.mjs                 ← CLI, запуск: node scraper.mjs
-├── bot.mjs                     ← Telegram-бот, запуск: node bot.mjs
+├── scraper.mjs                 ← CLI-скрапер, запуск: node scraper.mjs
+├── bot.mjs                     ← Telegram-бот, запуск: node bot.mjs (на сервере — под pm2)
 ├── src/
-│   ├── categories.mjs          ← список разделов
-│   ├── fajans-auth.mjs         ← логин + парсинг цены
-│   ├── scrape-core.mjs         ← вся логика обхода/скрапинга
-│   └── bot-store.mjs           ← сохранение выбранных категорий
+│   ├── categories.mjs          ← список 23 разделов аукциона
+│   ├── fajans-auth.mjs         ← логин (CSRF в стиле Yii2) + парсинг цены/ставок
+│   ├── scrape-core.mjs         ← вся логика обхода: списки разделов, детали лотов, оценка ИИ
+│   ├── ai-appraisal.mjs        ← запрос оценки к polza.ai + фильтр "выгодный лот"
+│   ├── ai-cache.mjs            ← кэш ИИ-оценок по номеру лота (оценка лота не меняется)
+│   ├── account-store.mjs       ← свой аккаунт fajans.lv на чат
+│   ├── results-store.mjs       ← результаты последнего скана (кнопка "показать снова")
+│   └── json-file.mjs           ← атомарная запись/чтение JSON-файлов
 ├── scripts/
-│   └── run-login-test.mjs      ← ручной тест логина
-└── data/
-    ├── bot-config.json         ← конфиг бота (генерируется)
-    └── lots.json               ← результат последнего скрапа 
+│   ├── run-login-test.mjs      ← ручной тест логина
+│   ├── run-scan-test.mjs       ← прогон всей цепочки скрапинга на маленьких разделах
+│   └── run-recovery-test.mjs   ← проверка отмены и восстановления после потери сессии
+└── data/                       ← генерируется, целиком под .gitignore
+    ├── accounts.json           ← аккаунты fajans.lv по чатам
+    ├── last-scan.json          ← результаты последнего скана
+    ├── ai-cache.json           ← кэш ИИ-оценок
+    └── lots.json               ← результат последнего запуска CLI-скрапера
+
+
+Как идёт сканирование (scrape-core.mjs)
+---------------------------------------
+Фаза 1 "listing":  списки лотов по разделам, 3 раздела параллельно (LIST_CONCURRENCY).
+Фаза 2 "scanning": страница каждого лота (цена/фото/описание) в 3 потока
+                   (DETAIL_CONCURRENCY), и одновременно с этим оценка через ИИ в 8
+                   потоков (AI_CONCURRENCY). Оценки, уже лежащие в ai-cache.json,
+                   берутся из кэша без запроса к ИИ.
+
+Итоговый темп обращений к fajans.lv — примерно 3 запроса/сек, и задаётся он ровно
+двумя константами в scrape-core.mjs: DETAIL_CONCURRENCY и defaultPoliteWait.
+Полный скан ~2700 лотов: первый раз ~25-30 минут (упирается в скорость ИИ),
+повторные ~15 минут (оценки берутся из кэша).
+
+Ограничения Telegram
+--------------------
+Лимит — примерно 1 запрос в секунду на чат. Сообщение с прогрессом правится не
+чаще раза в 5 секунд (PROGRESS_MIN_INTERVAL_MS в bot.mjs) и только если текст
+реально изменился; сверху стоит apiThrottler как страховка, а autoRetry сам
+пережидает 429. Нарушать это нельзя: за поток правок Telegram затыкает бота на
+20+ минут, и со стороны это выглядит как "бот умер и перестал отвечать".

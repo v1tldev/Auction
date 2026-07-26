@@ -12,7 +12,9 @@
   "license": "ISC",
   "type": "module",
   "dependencies": {
+    "@grammyjs/auto-retry": "^2.0.2",
     "@grammyjs/runner": "^2.0.3",
+    "@grammyjs/transformer-throttler": "^1.2.1",
     "cheerio": "^1.2.0",
     "dotenv": "^17.4.2",
     "grammy": "^1.45.1",

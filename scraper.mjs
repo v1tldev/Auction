@@ -32,28 +32,35 @@ async function main() {
     console.log("Успешно залогинились.\n");
   }
 
-  let lastCategory = null;
-  const { deals, scanned, found } = await scrapeCategories(CATEGORIES, cookieJar, {
+  // В консоли, в отличие от чата, частота вывода никого не ограничивает, но
+  // печатать по строке на каждый из ~2700 лотов всё равно незачем — раз в 2
+  // секунды достаточно, чтобы видеть, что процесс жив.
+  let lastLogAt = 0;
+  const result = await scrapeCategories(CATEGORIES, cookieJar, {
     onProgress(p) {
+      const now = Date.now();
+      if (now - lastLogAt < 2000) return;
+      lastLogAt = now;
       if (p.stage === "listing") {
-        if (p.name !== lastCategory) {
-          console.log(`Раздел "${p.name}" (${p.slug}):`);
-          lastCategory = p.name;
-        }
-        console.log(`  страница ${p.page}/${p.totalPages}`);
-      } else if (p.stage === "detail") {
-        console.log(`[детали ${p.index}/${p.total}]`);
+        console.log(`[списки] разделов готово ${p.done}/${p.total}, найдено лотов — ${p.lots}`);
       } else {
-        console.log(`[ИИ-оценка ${p.done}/${p.total}]`);
+        console.log(`[лоты ${p.index}/${p.total}] ИИ-оценка ${p.aiDone}/${p.aiTotal}, из кэша ${p.cached}`);
       }
     },
   });
+  const { deals, scanned, found } = result;
 
   const fs = await import("fs");
   const path = await import("path");
   fs.mkdirSync(path.dirname(OUT_FILE), { recursive: true });
   fs.writeFileSync(OUT_FILE, JSON.stringify(deals, null, 2), "utf-8");
-  console.log(`\nОтсканировано ${scanned} из ${found} найденных лотов, подходящих по цене — ${deals.length}. Сохранено в ${OUT_FILE}`);
+  console.log(
+    `\nОтсканировано ${scanned} из ${found} найденных лотов (с видимой ценой — ${result.priced}, ` +
+      `не открылись — ${result.failed}, оценок из кэша — ${result.cached}), ` +
+      `подходящих по цене — ${deals.length}. Сохранено в ${OUT_FILE}`
+  );
+  if (result.gatedMidScan) console.warn("ВНИМАНИЕ: скан прервался досрочно — аккаунт потерял доступ к ценам.");
+  if (result.aiUnavailable) console.warn("ВНИМАНИЕ: скан прервался досрочно — ИИ перестал отвечать (лимит/баланс?).");
 }
 
 main().catch((err) => {
