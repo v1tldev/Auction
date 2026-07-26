@@ -3,13 +3,27 @@ import OpenAI from "openai";
 const MODEL = "google/gemini-3-flash-preview";
 const BASE_URL = "https://polza.ai/api/v1";
 
+// По умолчанию у клиента таймаут запроса — 10 минут, плюс 2 встроенных
+// повтора при сбое (итого до ~30 минут на один зависший запрос). При скане
+// всех категорий (тысячи лотов) в самом конце мы ждём завершения ВСЕХ ИИ-
+// оценок разом (Promise.all) — зависший на сети запрос мог держать там весь
+// скан подолгу, и со стороны это выглядело как "завис/сломался". Сокращаем
+// таймаут до разумных 30с и отключаем встроенные повторы SDK — свой повтор
+// уже есть в appraiseLot() ниже, дублировать его на уровне SDK незачем.
+const REQUEST_TIMEOUT_MS = 30000;
+
 let client = null;
 function getClient() {
   if (!client) {
     if (!process.env.API_KEY) {
       throw new Error("В .env не задан API_KEY (ключ для polza.ai)");
     }
-    client = new OpenAI({ apiKey: process.env.API_KEY, baseURL: BASE_URL });
+    client = new OpenAI({
+      apiKey: process.env.API_KEY,
+      baseURL: BASE_URL,
+      timeout: REQUEST_TIMEOUT_MS,
+      maxRetries: 0,
+    });
   }
   return client;
 }
@@ -83,12 +97,31 @@ export async function appraiseLot(lot) {
   return { marketPrice, comment };
 }
 
+// Индивидуальные пороги минимальной разницы (в евро) по разделу — по просьбе
+// клиента: "Живопись" даёт слишком много ложных "выгодных" находок при 100€
+// (картины сложно оценивать, разброс большой), нужен порог пожёстче. А у
+// "Нумизматика"/"Серебро" абсолютные цены обычно ниже, и 100€ отсекало почти
+// всё — там порог, наоборот, мягче. Остальные разделы — дефолтные 100€.
+const CATEGORY_MIN_DIFF = {
+  "Живопись": 1000,
+  "Нумизматика": 30,
+  "Серебро": 30,
+};
+const DEFAULT_MIN_DIFF = 100;
+
+// categoryNames — названия разделов, которым принадлежит лот (лот может попасть
+// сразу в несколько) — берём порог первого совпавшего спецраздела, иначе дефолт.
+export function getMinDiffForCategories(categoryNames) {
+  for (const name of categoryNames) {
+    if (name in CATEGORY_MIN_DIFF) return CATEGORY_MIN_DIFF[name];
+  }
+  return DEFAULT_MIN_DIFF;
+}
+
 // Условие сделки: аукционная цена минимум в 3 раза меньше рыночной, и при этом
-// разница между рыночной и аукционной ценой — не меньше 100 евро (иначе выгода в
-// абсолютных числах слишком мала, даже если соотношение формально подходит).
-// Порог подняли с 30€ до 100€ по просьбе клиента — со старым фильтром находилось
-// слишком много мелких лотов, а нужны именно "жемчужины".
-export function passesDealFilter(auctionPrice, marketPrice) {
+// разница между рыночной и аукционной ценой — не меньше minDiff (по умолчанию
+// 100€, но для некоторых разделов другой порог — см. getMinDiffForCategories).
+export function passesDealFilter(auctionPrice, marketPrice, minDiff = DEFAULT_MIN_DIFF) {
   if (auctionPrice == null || marketPrice == null) return false;
-  return auctionPrice * 3 <= marketPrice && marketPrice - auctionPrice >= 100;
+  return auctionPrice * 3 <= marketPrice && marketPrice - auctionPrice >= minDiff;
 }

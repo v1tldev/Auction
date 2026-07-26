@@ -1,6 +1,6 @@
 import * as cheerio from "cheerio";
 import { BASE, BROWSER_HEADERS, jarToHeader, parsePriceFromLoadedHtml, withTimeout } from "./fajans-auth.mjs";
-import { appraiseLot, passesDealFilter, AIQuotaExceededError } from "./ai-appraisal.mjs";
+import { appraiseLot, passesDealFilter, getMinDiffForCategories, AIQuotaExceededError } from "./ai-appraisal.mjs";
 
 // ВАЖНО: за последней реальной страницей категории сайт НЕ отдаёт пустой список —
 // он просто повторяет последнюю страницу снова и снова для любого page=N сверх
@@ -120,7 +120,9 @@ function createLimiter(concurrency) {
  *
  * Возвращает { deals, scanned, found, gatedMidScan, aiUnavailable }, где deals —
  * лоты, прошедшие фильтр "аукционная цена минимум в 3 раза меньше рыночной, и
- * разница — не меньше 100€", с добавленными полями marketPrice/aiComment.
+ * разница — не меньше минимального порога для раздела" (порог по умолчанию 100€,
+ * но для некоторых разделов другой — см. getMinDiffForCategories в ai-appraisal.mjs),
+ * с добавленными полями marketPrice/aiComment.
  * gatedMidScan: true значит, что скан прервался досрочно из-за потери доступа к
  * ценам (см. GATED_STREAK_LIMIT ниже). aiUnavailable: true значит, что скан
  * прервался из-за того, что ИИ перестал отвечать (лимит/баланс у провайдера,
@@ -172,7 +174,7 @@ export async function scrapeCategories(categories, cookieJar, options = {}) {
   let consecutiveAiFailures = 0;
   let aiUnavailable = false;
 
-  function queueAppraisal(lot) {
+  function queueAppraisal(lot, minDiff) {
     if (aiUnavailable) return;
     if (lot.price == null || !lot.mainPhoto) return; // без цены/фото оценивать нечего
     aiDispatched++;
@@ -185,7 +187,7 @@ export async function scrapeCategories(categories, cookieJar, options = {}) {
             mainPhoto: lot.mainPhoto,
           });
           consecutiveAiFailures = 0;
-          if (passesDealFilter(lot.price, marketPrice)) {
+          if (passesDealFilter(lot.price, marketPrice, minDiff)) {
             deals.push({ ...lot, marketPrice, aiComment: comment });
           }
         } catch (err) {
@@ -229,7 +231,7 @@ export async function scrapeCategories(categories, cookieJar, options = {}) {
         description: detail.description,
       };
       scanned++;
-      queueAppraisal(result);
+      queueAppraisal(result, getMinDiffForCategories(lot.categories));
     } catch {
       // Ошибку скрапинга одного лота не считаем фатальной — просто пропускаем его.
     }

@@ -38,6 +38,32 @@ const runningScans = new Map(); // chatId -> { cancelled: boolean }
 // Результаты последнего анализа: { groups } — groups: [[categoryName, lots[]], ...].
 const sessions = new Map();
 
+// Сторожевой таймер на случай зависания скана по ЛЮБОЙ непредвиденной причине
+// (сеть, сторонний сервис, что угодно, что мы не предусмотрели явно). Пока идёт
+// скан, каждое событие прогресса обновляет watchdogLastProgress; если прогресса
+// нет дольше STALL_TIMEOUT_MS — считаем процесс зависшим, пишем об этом в чат
+// и завершаемся, чтобы pm2 перезапустил бота начисто.
+const STALL_TIMEOUT_MS = 10 * 60 * 1000; // 10 минут без прогресса
+let watchdogChatId = null;
+let watchdogLastProgress = null;
+
+setInterval(async () => {
+  if (watchdogLastProgress === null) return; // сейчас ничего не сканируется
+  if (Date.now() - watchdogLastProgress < STALL_TIMEOUT_MS) return;
+  const chatId = watchdogChatId;
+  console.error(`Скан завис (нет прогресса дольше ${STALL_TIMEOUT_MS / 60000} минут) — перезапускаю процесс.`);
+  try {
+    await bot.api.sendMessage(
+      chatId,
+      `⚠️ Сканирование зависло (нет прогресса больше ${STALL_TIMEOUT_MS / 60000} минут) — перезапускаю бота. ` +
+        "Через минуту попробуйте запустить сканирование заново."
+    );
+  } catch {
+    // не получилось отправить — не страшно, перезапускаемся в любом случае
+  }
+  process.exit(1);
+}, 60000);
+
 function getState(chatId) {
   if (!uiState.has(chatId)) uiState.set(chatId, { mode: "main", lastMessageId: null });
   return uiState.get(chatId);
@@ -108,6 +134,18 @@ function truncate(text, max) {
   return text.length > max ? text.slice(0, max - 1).trimEnd() + "…" : text;
 }
 
+// Группирует отобранные лоты по разделу (как их вернул скрапинг — лот,
+// подошедший сразу под несколько разделов, попадёт в свою комбинированную
+// группу, а не задвоится в каждом разделе по отдельности): [[categoryName, lots[]], ...]
+function groupDealsByCategory(deals) {
+  const groupsMap = new Map();
+  for (const lot of deals) {
+    if (!groupsMap.has(lot.category)) groupsMap.set(lot.category, []);
+    groupsMap.get(lot.category).push(lot);
+  }
+  return [...groupsMap.entries()];
+}
+
 // groups: [[categoryName, lots[]], ...] — по кнопке на раздел, с количеством
 // отобранных ИИ лотов в каждом.
 function categoriesInlineKeyboard(groups) {
@@ -166,6 +204,10 @@ async function startAnalysis(ctx, chatId, categories) {
   state.mode = "scanning";
   const cancelToken = { cancelled: false };
   runningScans.set(chatId, cancelToken);
+  watchdogChatId = chatId;
+  watchdogLastProgress = Date.now();
+
+  try {
 
   // При скане всех категорий список из 23 названий в чате только мешает —
   // пишем просто "по всем категориям". Для демо-теста (один раздел) название
@@ -232,6 +274,7 @@ async function startAnalysis(ctx, chatId, categories) {
         const result = await scrapeCategories(categories, login.cookieJar, {
           isCancelled: () => cancelToken.cancelled,
           async onProgress(p) {
+            watchdogLastProgress = Date.now(); // отмечаем сразу, до троттлинга UI ниже
             const now = Date.now();
             // Раньше троттлинг был общим на все три стадии ("список"/"детали"/
             // "оценка ИИ") — а поскольку "детали" тикают чаще и равномернее, они
@@ -289,16 +332,7 @@ async function startAnalysis(ctx, chatId, categories) {
 
   const wasCancelled = cancelToken.cancelled;
 
-  // Группируем отобранные лоты по разделу (как их вернул скрапинг — лот,
-  // подошедший сразу под несколько разделов, попадёт в свою комбинированную
-  // группу, а не задвоится в каждом разделе по отдельности), чтобы показать
-  // кнопку на каждый раздел с количеством находок.
-  const groupsMap = new Map();
-  for (const lot of deals) {
-    if (!groupsMap.has(lot.category)) groupsMap.set(lot.category, []);
-    groupsMap.get(lot.category).push(lot);
-  }
-  const groups = [...groupsMap.entries()];
+  const groups = groupDealsByCategory(deals);
   sessions.set(chatId, { groups });
   // Один клиент, один аукцион — сохраняем на диск, чтобы отдать эти же
   // результаты повторно по кнопке "Показать результаты последнего сканирования",
@@ -321,6 +355,10 @@ async function startAnalysis(ctx, chatId, categories) {
 
   if (groups.length) {
     await ctx.reply("Выберите раздел, чтобы посмотреть отобранные лоты:", { reply_markup: categoriesInlineKeyboard(groups) });
+  }
+  } finally {
+    watchdogChatId = null;
+    watchdogLastProgress = null;
   }
 }
 
